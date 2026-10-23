@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+# never commit voice recordings, audio, or models
+captures/
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.onnx
+*.tar.bz2
