@@ -1,6 +1,9 @@
 # stt — offline speech-to-text for Android (Termux / Kali), CPU only
-
-A command-line transcriber built on [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with int8 models. No cloud, no NPU, no root.
+Generates text from speech many times faster than real-time.
+Input from microphone or file.
+Unique denoising strategies for low-energy vocal data near noise floor.
+A command-line transcriber built on [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with int8 models. 
+Fast, No cloud used, no NPU needed, no root needed.
 
 ```
 stt file a.wav talk.mp4 [--jsonl] [--out FILE] [-a 0-5 | --robust] [-v]
