@@ -1,4 +1,5 @@
-# stt — offline speech-to-text for Android (Termux / Kali), CPU only
+# stt — offline speech-to-text 
+Tested on Android Termux in proot-distro ubuntu and kali. 
 Generates text from speech many times faster than real-time.
 Input from microphone or file.
 Unique denoising strategies for low-energy vocal data near noise floor.
@@ -23,7 +24,8 @@ stt <cmd> --model list          # installed models by kind;  --model NAME picks 
 ## Install
 Tested on aarch64 Android (Kali userland and Termux binaries side by side). Python 3.10+.
 ```sh
-apt install python3-venv ffmpeg sox pulseaudio pulseaudio-utils wget      # (root; sox is optional)
+apt install python3-venv ffmpeg pulseaudio pulseaudio-utils wget
+sudo apt install sox   #(root; sox is optional, this is why we use proot-distro linux)
 python3 -m venv ~/.local/share/stt/venv && . ~/.local/share/stt/venv/bin/activate
 pip install -e .                                                           # pulls sherpa-onnx, numpy, soundfile
 sh scripts/install_models.sh            # add --all for kroko + the other denoisers
