@@ -1,10 +1,17 @@
-"""Config loading: ~/.config/stt/config.toml, written with defaults on first run."""
+"""Config loading: ~/.config/stt/config.toml (or %APPDATA%/stt/config.toml on Windows), written with defaults on first run."""
 import os
+import sys
 import tomllib
 from pathlib import Path
 
-CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "stt" / "config.toml"
-DATA_DIR = Path.home() / ".local" / "share" / "stt"
+IS_WIN = sys.platform == "win32"
+
+if IS_WIN:
+    CONFIG_PATH = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "stt" / "config.toml"
+    DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "stt"
+else:
+    CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "stt" / "config.toml"
+    DATA_DIR = Path.home() / ".local" / "share" / "stt"
 
 DEFAULTS = {
     "threads": 4,
@@ -35,6 +42,8 @@ DEFAULTS = {
     "pulse_port": 4714,
     "termux_bin": "/data/data/com.termux/files/usr/bin",
     "termux_tmp": "/data/data/com.termux/files/home/.cache/stt",
+    "windows_mic_device": "default",
+    "windows_backend": "auto",
 }
 
 TEMPLATE = """# stt configuration (created on first run; edit freely)
@@ -67,6 +76,9 @@ mic_chunk_seconds = {mic_chunk_seconds}  # termux backend chunk length
 pulse_port = {pulse_port}               # private PulseAudio server port used by stt
 termux_bin = "{termux_bin}"
 termux_tmp = "{termux_tmp}"             # must be a path the Termux:API app can write
+# Windows mic configuration
+windows_mic_device = "{windows_mic_device}"  # audio device name or "default" (DirectShow/WASAPI)
+windows_backend = "{windows_backend}"        # auto | dshow | sounddevice
 """
 
 

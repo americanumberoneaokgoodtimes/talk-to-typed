@@ -24,6 +24,12 @@ def _common(p):
                    help="noisy-audio effort: 0 off, 1 loose VAD, 2 +denoise, 3 tuned (same as --robust), "
                         "4 +second variant, keep the more complete, 5 = --distant. Higher = slower. File and termux-mic only")
     p.add_argument("--robust", action="store_true", help="shortcut for --aggressiveness 3")
+    p.add_argument("--subnoise", action="store_true",
+                   help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
+    p.add_argument("--auto", action="store_true",
+                   help="dynamically determine window, step, and filtering based on duration and heavy noise floor")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="interactive parameter wizard with educational guidance before running")
     p.add_argument("--lang", help="language hint; ignored by models that auto-detect or are English-only")
 
 
@@ -32,10 +38,102 @@ def _lang_note(args):
         print(f"note: --lang {args.lang} ignored (selected models auto-detect / are English-only)", file=sys.stderr)
 
 
+def make_progress_bar():
+    start_time = time.time()
+    def progress_cb(current_step, total_steps, current_sec, total_sec):
+        now = time.time()
+        elapsed = now - start_time
+        pct = int((current_step / total_steps) * 100) if total_steps > 0 else 0
+        rtf = elapsed / max(current_sec, 0.001)
+        rem_sec = max(0.0, total_sec - current_sec)
+        eta = rem_sec * rtf
+        cur_m, cur_s = divmod(int(current_sec), 60)
+        tot_m, tot_s = divmod(int(total_sec), 60)
+        eta_m, eta_s = divmod(int(eta), 60)
+        bar_len = 20
+        filled = int(bar_len * (pct / 100.0))
+        bar = "=" * filled + (">" if filled < bar_len else "") + " " * max(0, bar_len - filled - (1 if filled < bar_len else 0))
+        line = f"\r\033[K[stt] [{bar}] {pct:3d}% | {cur_m:02d}:{cur_s:02d}/{tot_m:02d}:{tot_s:02d} | Speed: {rtf:.2f}x | ETA: {eta_m:02d}:{eta_s:02d}"
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    return progress_cb
+
+
+def interactive_wizard(args, cfg, is_file=True):
+    print("\n" + "=" * 65, file=sys.stderr)
+    print("  STT Interactive Configuration Wizard", file=sys.stderr)
+    print("=" * 65, file=sys.stderr)
+    print("Configure acoustic and transcription parameters with in-depth guidance.", file=sys.stderr)
+    print("Press [Enter] at any prompt to accept the recommended default.\n", file=sys.stderr)
+
+    # 1. Strategy
+    print("[1/5] Processing Strategy & Noise Handling:", file=sys.stderr)
+    print("  - 'auto'    : Dynamic sub-noise scanning with rumble removal (best for heavy noise)", file=sys.stderr)
+    print("  - 'standard': Fast standard Silero VAD segmentation (best for clean audio)", file=sys.stderr)
+    print("  - 'robust'  : Neural denoising + blending (aggressiveness level 3)", file=sys.stderr)
+    choice = input("  Select strategy [auto]: ").strip().lower() or "auto"
+    if choice == "auto":
+        args.auto = True
+    elif choice == "robust":
+        args.robust = True
+    elif choice == "standard":
+        args.aggressiveness = 0
+        args.auto = False
+
+    # 2. Rumble Rejection High-Pass Filter
+    print("\n[2/5] Low-Frequency Rumble Filter (High-pass cutoff in Hz):", file=sys.stderr)
+    print("  Mic recordings often have >85% of energy below 100 Hz (HVAC, handling rumble).", file=sys.stderr)
+    print("  Stripping this rumble restores dynamic range and prevents VAD saturation.", file=sys.stderr)
+    print("  Recommended: 120 Hz (cuts rumble without touching human speech formants).", file=sys.stderr)
+    hp_in = input("  High-pass cutoff Hz [120]: ").strip()
+    if hp_in.isdigit():
+        args.rumble_cutoff = float(hp_in)
+    else:
+        args.rumble_cutoff = 120.0
+
+    # 3. Formant Equalization Boost
+    print("\n[3/5] Speech Formant Equalization Boost (dB):", file=sys.stderr)
+    print("  Gently boosts the 300-3200 Hz speech frequency band before denoising,", file=sys.stderr)
+    print("  lifting faint vowel and consonant formants above the neural threshold.", file=sys.stderr)
+    print("  Recommended: 3.5 dB for quiet/sub-noise speech, 0.0 dB for clean speech.", file=sys.stderr)
+    boost_in = input("  Formant boost dB [3.5]: ").strip()
+    try:
+        args.formant_boost = float(boost_in) if boost_in else 3.5
+    except ValueError:
+        args.formant_boost = 3.5
+
+    # 4. Transducer Blank Penalty
+    print("\n[4/5] Transducer Blank Penalty (0.0 to 1.5):", file=sys.stderr)
+    print("  In neural transducers, faint speech causes blank tokens. A small penalty", file=sys.stderr)
+    print("  forces phoneme emission. Setting >1.5 may cause repetitive word loops.", file=sys.stderr)
+    print("  Recommended: 0.7 for faint speech, 0.0 for standard speech.", file=sys.stderr)
+    bp_in = input("  Blank penalty [0.7]: ").strip()
+    try:
+        args.blank_penalty = float(bp_in) if bp_in else 0.7
+    except ValueError:
+        args.blank_penalty = 0.7
+
+    # 5. Inference Threads
+    print("\n[5/5] Inference Threads:", file=sys.stderr)
+    print("  Number of CPU threads allocated to sherpa-onnx inference.", file=sys.stderr)
+    def_threads = cfg.get("threads", 4)
+    thr_in = input(f"  CPU threads [{def_threads}]: ").strip()
+    if thr_in.isdigit():
+        args.threads = int(thr_in)
+
+    print("\n" + "=" * 65, file=sys.stderr)
+    print("  Configuration complete. Proceeding to execution...", file=sys.stderr)
+    print("=" * 65 + "\n", file=sys.stderr)
+
+
 def cmd_file(args, cfg):
     from . import asr, audio
 
     _lang_note(args)
+    if getattr(args, "interactive", False):
+        interactive_wizard(args, cfg, is_file=True)
+
+    is_auto = getattr(args, "auto", False) or (args.aggressiveness is None and not args.robust and not args.subnoise)
     level = _level(args, cfg)
     rec = asr.offline(cfg, args.model, args.threads)
     out = open(args.out, "w") if args.out else sys.stdout
@@ -47,14 +145,40 @@ def cmd_file(args, cfg):
             except RuntimeError as e:
                 print(f"error: {e}", file=sys.stderr)
                 continue
-            t = time.time()
-            triples = robust.transcribe(rec, samples, cfg, level)
-            dt = time.time() - t
+
             dur = len(samples) / audio.SR
+            t = time.time()
+
+            if is_auto or getattr(args, "subnoise", False):
+                auto_params = robust.auto_tune_settings(dur)
+                if hasattr(args, "rumble_cutoff"):
+                    auto_params["low_hz"] = args.rumble_cutoff
+                if hasattr(args, "formant_boost"):
+                    auto_params["boost_db"] = args.formant_boost
+                if hasattr(args, "blank_penalty"):
+                    auto_params["blank_penalty"] = args.blank_penalty
+
+                print(f"\n[stt auto-tune] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
+                print("[stt auto-tune] Deterministic Configuration Reasoning:", file=sys.stderr)
+                for reason in auto_params["reasoning"]:
+                    print(f"  • {reason}", file=sys.stderr)
+
+                progress_cb = make_progress_bar()
+                triples = robust.transcribe(
+                    rec, samples, cfg, level=0, subnoise=True,
+                    params=auto_params, progress_cb=progress_cb
+                )
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+            else:
+                triples = robust.transcribe(rec, samples, cfg, level, subnoise=False)
+
+            dt = time.time() - t
             total_audio += dur
             total_proc += dt
             if args.verbose:
                 print(f"{path}: {dur:.1f}s audio, {dt:.2f}s processing, RTF {dt / max(dur, 1e-9):.3f}", file=sys.stderr)
+
             lines = []
             for s, e, text in triples:
                 if args.jsonl:
@@ -64,7 +188,8 @@ def cmd_file(args, cfg):
             if not args.jsonl:
                 if len(args.paths) > 1:
                     out.write(f"== {path}\n")
-                out.write(" ".join(lines) + "\n")
+                if lines:
+                    out.write(" ".join(lines) + "\n")
         out.flush()
     finally:
         if args.out:
@@ -77,12 +202,14 @@ def cmd_mic(args, cfg):
     from . import mic
 
     _lang_note(args)
+    if getattr(args, "interactive", False):
+        interactive_wizard(args, cfg, is_file=False)
     if _level(args, cfg):
         print("[stt] aggressiveness applies to the termux backend; the streaming pulse backend ignores it", file=sys.stderr)
     backend = args.backend or cfg["mic_backend"]
     avail = mic.detect(cfg)
     if backend == "auto":
-        order = [b for b in ("pulse", "termux") if avail[b][0]]
+        order = [b for b in ("pulse", "windows", "termux") if b in avail and avail[b][0]]
         if not order:
             sys.exit("no mic backend available; run `stt doctor`")
     else:
@@ -97,7 +224,11 @@ def cmd_mic(args, cfg):
 
     # Ctrl+C / SIGTERM -> KeyboardInterrupt so `finally` blocks reap child processes.
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    runners = {"pulse": mic.run_pulse_utterance if (args.whisper or args.distant) else mic.run_pulse, "termux": mic.run_termux}
+    runners = {
+        "pulse": mic.run_pulse_utterance if (args.whisper or args.distant) else mic.run_pulse,
+        "windows": lambda c, a, e: (mic.run_pulse_utterance if (a.whisper or a.distant) else mic.run_pulse)(c, a, e, src=mic.get_windows_source(c)),
+        "termux": mic.run_termux,
+    }
     for i, b in enumerate(order):
         try:
             print(f"[stt] backend: {b} — listening, Ctrl+C to stop", file=sys.stderr)
@@ -170,7 +301,7 @@ def main(argv=None):
 
     m = sub.add_parser("mic", help="live microphone transcription")
     m.add_argument("--partial", action="store_true", help="show interim text (pulse backend)")
-    m.add_argument("--backend", choices=["pulse", "termux"], help="override auto-detection")
+    m.add_argument("--backend", choices=["pulse", "termux", "windows"], help="override auto-detection")
     m.add_argument("--jsonl", action="store_true")
     m.add_argument("--whisper", action="store_true",
                    help="whispering / noisy room: cut utterances with the VAD, denoise + normalize each, decode with the "

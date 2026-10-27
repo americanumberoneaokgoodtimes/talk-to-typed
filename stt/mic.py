@@ -362,6 +362,167 @@ def run_termux(cfg: dict, args, emit):
             f.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- Windows (DirectShow / sounddevice)
+
+def list_dshow_audio_devices() -> list[str]:
+    ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if not ffmpeg:
+        return []
+    try:
+        p = subprocess.run(
+            [ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=5
+        )
+        lines = (p.stderr or "").splitlines()
+        audio_section = False
+        devices = []
+        for line in lines:
+            if "DirectShow audio devices" in line:
+                audio_section = True
+                continue
+            if "DirectShow video devices" in line:
+                audio_section = False
+            if audio_section and '"' in line:
+                dev = line.split('"')[1]
+                if dev and dev not in devices and not dev.startswith("@device"):
+                    devices.append(dev)
+        return devices
+    except Exception:
+        return []
+
+
+class WindowsDShowSource:
+    """Windows audio capture using ffmpeg with DirectShow."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.rec: subprocess.Popen | None = None
+        self.backlog = lambda: 0
+
+    def start(self):
+        ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg binary not found on PATH")
+        device = self.cfg.get("windows_mic_device", "default")
+        if device == "default":
+            dev_names = list_dshow_audio_devices()
+            device_arg = f'audio={dev_names[0]}' if dev_names else 'audio=default'
+        else:
+            device_arg = f'audio={device}'
+
+        cmd = [
+            ffmpeg, "-v", "error", "-nostdin",
+            "-f", "dshow", "-i", device_arg,
+            "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000", "-"
+        ]
+        try:
+            self.rec = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                bufsize=0
+            )
+        except OSError as e:
+            raise RuntimeError(f"failed to start ffmpeg dshow: {e}")
+
+        time.sleep(0.3)
+        if self.rec.poll() is not None:
+            err = self.rec.stderr.read().decode(errors="replace").strip() if self.rec.stderr else ""
+            raise RuntimeError(f"ffmpeg dshow capture exited: {err}")
+
+    def blocks(self):
+        q: queue.Queue = queue.Queue()
+        stdout = self.rec.stdout
+
+        def reader():
+            nbytes = BLOCK * 2
+            buf = b""
+            while True:
+                try:
+                    d = stdout.read(nbytes - len(buf))
+                    if not d:
+                        q.put(None)
+                        return
+                    buf += d
+                    if len(buf) == nbytes:
+                        q.put(np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0)
+                        buf = b""
+                except Exception:
+                    q.put(None)
+                    return
+
+        threading.Thread(target=reader, daemon=True).start()
+        self.backlog = q.qsize
+        while True:
+            b = q.get()
+            if b is None:
+                return
+            yield b
+
+    def stop(self):
+        _kill(self.rec)
+        self.rec = None
+
+
+class SoundDeviceSource:
+    """Cross-platform / Windows capture using sounddevice (PortAudio/WASAPI)."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.stream = None
+        self.q: queue.Queue = queue.Queue()
+        self.backlog = self.q.qsize
+
+    def start(self):
+        import sounddevice as sd
+        device = None if self.cfg.get("windows_mic_device", "default") == "default" else self.cfg.get("windows_mic_device")
+
+        def callback(indata, frames, time_info, status):
+            self.q.put(indata.flatten().copy())
+
+        self.stream = sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            blocksize=BLOCK,
+            dtype="float32",
+            device=device,
+            callback=callback,
+        )
+        self.stream.start()
+
+    def blocks(self):
+        while True:
+            b = self.q.get()
+            if b is None:
+                return
+            yield b
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.q.put(None)
+
+
+def get_windows_source(cfg: dict):
+    backend = cfg.get("windows_backend", "auto")
+    if backend == "sounddevice":
+        return SoundDeviceSource(cfg)
+    elif backend == "dshow":
+        return WindowsDShowSource(cfg)
+    else:
+        try:
+            import sounddevice  # noqa: F401
+            return SoundDeviceSource(cfg)
+        except ImportError:
+            return WindowsDShowSource(cfg)
+
+
 # ---------------------------------------------------------------- detection
 
 def detect(cfg: dict) -> dict:
@@ -379,4 +540,29 @@ def detect(cfg: dict) -> dict:
         except Exception as e:
             detail = str(e)
     res["termux"] = (ok, detail)
+
+    # Windows backend detection
+    has_sd = False
+    sd_detail = ""
+    try:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        in_devs = [d for d in devs if d.get('max_input_channels', 0) > 0]
+        if in_devs:
+            has_sd = True
+            sd_detail = f"sounddevice ({in_devs[0].get('name')})"
+    except Exception:
+        pass
+
+    dshow_devs = list_dshow_audio_devices()
+    dshow_ok = bool(shutil.which("ffmpeg") and (dshow_devs or sys.platform == "win32"))
+
+    if has_sd:
+        res["windows"] = (True, sd_detail)
+    elif dshow_ok:
+        dev_str = dshow_devs[0] if dshow_devs else "DirectShow default"
+        res["windows"] = (True, f"ffmpeg dshow: {dev_str}")
+    else:
+        res["windows"] = (False, "ffmpeg dshow or sounddevice not found")
+
     return res
