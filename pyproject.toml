@@ -1,16 +1,68 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stt"
-version = "0.1.0"
-description = "Offline speech-to-text CLI built on sherpa-onnx"
+name = "talk-to-typed"
+version = "0.2.0"
+description = "High-performance offline speech-to-text CLI for Linux, Windows, and Android (sherpa-onnx, CPU-only, sub-noise formant recovery)"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["sherpa-onnx", "numpy", "soundfile"]
+license = "MIT"
+authors = [
+    {name = "americanumberoneaokgoodtimes", email = "americanumberoneaokgoodtimes@gmail.com"}
+]
+keywords = [
+    "speech-to-text",
+    "asr",
+    "sherpa-onnx",
+    "audio",
+    "offline",
+    "subnoise",
+    "parakeet",
+    "denoiser",
+    "transcription"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: Android",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "sherpa-onnx>=2.0.0",
+    "numpy>=1.22.0",
+    "soundfile>=0.12.0",
+]
+
+[project.optional-dependencies]
+windows = [
+    "sounddevice>=0.4.6",
+]
+dev = [
+    "build",
+    "wheel",
+    "twine",
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/americanumberoneaokgoodtimes/talk-to-typed"
+Repository = "https://github.com/americanumberoneaokgoodtimes/talk-to-typed.git"
+Issues = "https://github.com/americanumberoneaokgoodtimes/talk-to-typed/issues"
 
 [project.scripts]
 stt = "stt.cli:main"
+talk-to-typed = "stt.cli:main"
 
 [tool.setuptools]
 packages = ["stt"]

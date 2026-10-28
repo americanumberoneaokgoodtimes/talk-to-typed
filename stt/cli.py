@@ -1,5 +1,7 @@
 import argparse
+import glob
 import json
+import os
 import shutil
 import signal
 import sys
@@ -7,6 +9,52 @@ import time
 from pathlib import Path
 
 from . import __version__, config, robust
+
+MEDIA_EXTENSIONS = {
+    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac",
+    ".wma", ".mp4", ".mkv", ".avi", ".mov", ".webm", ".alac", ".aiff"
+}
+
+
+def collect_media_paths(raw_paths: list[str], recursive: bool = False) -> list[str]:
+    """Expand file and directory paths, optionally recursing into subdirectories."""
+    collected = []
+    seen = set()
+
+    def add_file(p: Path):
+        abs_str = str(p.resolve())
+        if abs_str not in seen and p.suffix.lower() in MEDIA_EXTENSIONS:
+            seen.add(abs_str)
+            collected.append(str(p))
+
+    for p_str in raw_paths:
+        p = Path(p_str)
+        if p.is_dir():
+            if recursive:
+                for root, _, files in os.walk(p):
+                    for fname in sorted(files):
+                        add_file(Path(root) / fname)
+            else:
+                for child in sorted(p.iterdir()):
+                    if child.is_file():
+                        add_file(child)
+        elif p.is_file():
+            add_file(p)
+        else:
+            matches = sorted(glob.glob(p_str))
+            for m in matches:
+                mp = Path(m)
+                if mp.is_file():
+                    add_file(mp)
+                elif mp.is_dir() and recursive:
+                    for root, _, files in os.walk(mp):
+                        for fname in sorted(files):
+                            add_file(Path(root) / fname)
+                elif mp.is_dir():
+                    for child in sorted(mp.iterdir()):
+                        if child.is_file():
+                            add_file(child)
+    return collected
 
 
 def _level(args, cfg) -> int:
@@ -30,6 +78,8 @@ def _common(p):
                    help="dynamically determine window, step, and filtering based on duration and heavy noise floor")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="interactive parameter wizard with educational guidance before running")
+    p.add_argument("--window-size", type=float, help="sliding window length in seconds (subnoise mode)")
+    p.add_argument("--step-size", type=float, help="sliding window stride in seconds (subnoise mode)")
     p.add_argument("--lang", help="language hint; ignored by models that auto-detect or are English-only")
 
 
@@ -67,18 +117,32 @@ def interactive_wizard(args, cfg, is_file=True):
     print("Press [Enter] at any prompt to accept the recommended default.\n", file=sys.stderr)
 
     # 1. Strategy
-    print("[1/5] Processing Strategy & Noise Handling:", file=sys.stderr)
-    print("  - 'auto'    : Dynamic sub-noise scanning with rumble removal (best for heavy noise)", file=sys.stderr)
-    print("  - 'standard': Fast standard Silero VAD segmentation (best for clean audio)", file=sys.stderr)
-    print("  - 'robust'  : Neural denoising + blending (aggressiveness level 3)", file=sys.stderr)
-    choice = input("  Select strategy [auto]: ").strip().lower() or "auto"
-    if choice == "auto":
-        args.auto = True
-    elif choice == "robust":
-        args.robust = True
-    elif choice == "standard":
-        args.aggressiveness = 0
-        args.auto = False
+    if is_file:
+        print("[1/5] Processing Strategy & Noise Handling:", file=sys.stderr)
+        print("  - 'auto'    : Dynamic sub-noise scanning with rumble removal (best for heavy noise)", file=sys.stderr)
+        print("  - 'standard': Fast standard Silero VAD segmentation (best for clean audio)", file=sys.stderr)
+        print("  - 'robust'  : Neural denoising + blending (aggressiveness level 3)", file=sys.stderr)
+        choice = input("  Select strategy [auto]: ").strip().lower() or "auto"
+        if choice == "auto":
+            args.auto = True
+        elif choice == "robust":
+            args.robust = True
+        elif choice == "standard":
+            args.aggressiveness = 0
+            args.auto = False
+    else:
+        print("[1/5] Microphone Mode & Acoustic Strategy:", file=sys.stderr)
+        print("  - 'streaming': Real-time low-latency streaming tokens (Nemotron / Kroko)", file=sys.stderr)
+        print("  - 'subnoise' : Continuous sliding ring-buffer scan with multi-model denoising (faint speech)", file=sys.stderr)
+        print("  - 'whisper'  : Utterance segmentation on pauses + offline Parakeet (level 3)", file=sys.stderr)
+        print("  - 'distant'  : Sensitive VAD for quiet/far-away speech (level 5)", file=sys.stderr)
+        choice = input("  Select mic mode [streaming]: ").strip().lower() or "streaming"
+        if choice == "subnoise":
+            args.subnoise = True
+        elif choice == "whisper":
+            args.whisper = True
+        elif choice == "distant":
+            args.distant = True
 
     # 2. Rumble Rejection High-Pass Filter
     print("\n[2/5] Low-Frequency Rumble Filter (High-pass cutoff in Hz):", file=sys.stderr)
@@ -133,13 +197,22 @@ def cmd_file(args, cfg):
     if getattr(args, "interactive", False):
         interactive_wizard(args, cfg, is_file=True)
 
+    resolved_paths = collect_media_paths(args.paths, recursive=getattr(args, "recursive", False))
+    if not resolved_paths:
+        sys.exit("[stt] error: no supported audio/video files found in given paths")
+
     is_auto = getattr(args, "auto", False) or (args.aggressiveness is None and not args.robust and not args.subnoise)
     level = _level(args, cfg)
     rec = asr.offline(cfg, args.model, args.threads)
     out = open(args.out, "w") if args.out else sys.stdout
     total_audio = total_proc = 0.0
+    total_files = len(resolved_paths)
+
     try:
-        for path in args.paths:
+        for idx, path in enumerate(resolved_paths):
+            if total_files > 1 and not args.jsonl:
+                print(f"\n[stt file {idx + 1}/{total_files}] Processing: {path}", file=sys.stderr)
+
             try:
                 samples = audio.decode(path)
             except RuntimeError as e:
@@ -157,6 +230,10 @@ def cmd_file(args, cfg):
                     auto_params["boost_db"] = args.formant_boost
                 if hasattr(args, "blank_penalty"):
                     auto_params["blank_penalty"] = args.blank_penalty
+                if getattr(args, "window_size", None):
+                    auto_params["win_sec"] = float(args.window_size)
+                if getattr(args, "step_size", None):
+                    auto_params["step_sec"] = float(args.step_size)
 
                 print(f"\n[stt auto-tune] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
                 print("[stt auto-tune] Deterministic Configuration Reasoning:", file=sys.stderr)
@@ -186,7 +263,7 @@ def cmd_file(args, cfg):
                 else:
                     lines.append(text)
             if not args.jsonl:
-                if len(args.paths) > 1:
+                if total_files > 1:
                     out.write(f"== {path}\n")
                 if lines:
                     out.write(" ".join(lines) + "\n")
@@ -224,9 +301,16 @@ def cmd_mic(args, cfg):
 
     # Ctrl+C / SIGTERM -> KeyboardInterrupt so `finally` blocks reap child processes.
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    if getattr(args, "subnoise", False):
+        pulse_runner = mic.run_pulse_subnoise
+    elif args.whisper or args.distant:
+        pulse_runner = mic.run_pulse_utterance
+    else:
+        pulse_runner = mic.run_pulse
+
     runners = {
-        "pulse": mic.run_pulse_utterance if (args.whisper or args.distant) else mic.run_pulse,
-        "windows": lambda c, a, e: (mic.run_pulse_utterance if (a.whisper or a.distant) else mic.run_pulse)(c, a, e, src=mic.get_windows_source(c)),
+        "pulse": pulse_runner,
+        "windows": lambda c, a, e: pulse_runner(c, a, e, src=mic.get_windows_source(c)),
         "termux": mic.run_termux,
     }
     for i, b in enumerate(order):
@@ -292,7 +376,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("file", help="transcribe audio/video files")
-    f.add_argument("paths", nargs="+")
+    f.add_argument("paths", nargs="+", help="audio/video file or directory paths")
+    f.add_argument("-r", "--recursive", action="store_true", help="recursively search directories for audio/video files")
     f.add_argument("--jsonl", action="store_true", help="JSON lines with start/end/text")
     f.add_argument("--out", help="write output to this file")
     f.add_argument("-v", "--verbose", action="store_true", help="print timing / real-time factor to stderr")

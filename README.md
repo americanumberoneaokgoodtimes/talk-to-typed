@@ -47,14 +47,26 @@ A default config is written to `~/.config/stt/config.toml` on Linux/Android and 
 
 ## Modes
 - **`stt file`** — ffmpeg decode (any format) -> Silero VAD -> Parakeet.
+- **`stt file <folder> -r`** — recursive batch processing across folders/subdirectories for all `.wav`, `.mp3`, `.m4a`, `.flac`, etc.
 - **`stt file --subnoise`** — high-pass rumble removal (<120Hz) + multi-model denoising (GTCRN + DPDFNet4) + sliding window formant scanning. Uncovers quiet and distant speech buried at or below the ambient noise floor.
 - **`stt mic`** — streaming recognizer with VAD endpointing; `--partial` shows interim text.
+- **`stt mic --subnoise`** — live continuous sliding ring-buffer scan with multi-model denoising. Bypasses standard binary VAD thresholds for live acoustic surveillance and listening to faint whispers/sub-noise speech.
 - **`stt mic --whisper`** — the VAD cuts utterances; each is normalized/denoised and decoded by Parakeet. Text appears when you pause. Calibrates on 2 s of room noise at start.
 - **`stt mic --distant`** — as `--whisper`, with the most sensitive VAD, more gain and level-5 decoding for very quiet speech. Falls back to subnoise scanning when no speech is detected.
 - **Mic backends** (`--backend`, auto by default):
   - `pulse`: private PulseAudio server with the OpenSL ES source (or system default) and `parec`.
   - `windows`: DirectShow capture via `ffmpeg` (`-f dshow`) or PortAudio/WASAPI via `sounddevice`.
   - `termux`: 5 s chunks via Termux:API (`termux-microphone-record`).
+
+## Packaging & Releases
+- **Build PyPI Distribution** (sdist & wheel):
+  ```sh
+  python scripts/build_release.py
+  ```
+- **Build Standalone Binary**:
+  ```sh
+  python scripts/build_standalone.py
+  ```
 
 ## Noisy audio: `-a / --aggressiveness` (`--robust` == 3)
 | Level | What it does | Mean WER* |

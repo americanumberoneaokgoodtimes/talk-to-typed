@@ -286,6 +286,144 @@ def run_pulse_utterance(cfg: dict, args, emit, src=None):
             print(f"[stt] saved raw audio to {args.save}", file=sys.stderr)
 
 
+def run_pulse_subnoise(cfg: dict, args, emit, src=None):
+    """Continuous sliding ring-buffer formant scan on live mic input for sub-noise speech.
+
+    Designed for acoustic surveillance and continuous listening to faint or sub-noise-floor
+    speech, bypassing standard binary VAD thresholds.
+    """
+    rec = asr.offline(cfg, args.model, args.threads)
+    src = src or PulseSource(cfg)
+    src.start()
+
+    low_hz = getattr(args, "rumble_cutoff", 120.0)
+    boost_db = getattr(args, "formant_boost", 3.0)
+    window_sec = float(getattr(args, "window_size", 5.0) or 5.0)
+    step_sec = float(getattr(args, "step_size", 1.5) or 1.5)
+
+    step_blocks = max(1, int(step_sec * audio.SR / BLOCK))
+    max_blocks = max(step_blocks + 1, int(window_sec * audio.SR / BLOCK))
+
+    ring = collections.deque(maxlen=max_blocks)
+    block_iter = src.blocks()
+    stop_event = threading.Event()
+
+    task_q: queue.Queue = queue.Queue(maxsize=3)
+    emitted_words_history: list[str] = []
+
+    def norm(c):
+        mx = float(np.abs(c).max())
+        return c * (0.8 / max(mx, 1e-6)) if mx > 0 else c
+
+    def inference_worker():
+        nonlocal emitted_words_history
+        while not stop_event.is_set():
+            try:
+                item = task_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+
+            window_audio, t_capture = item
+            dur = len(window_audio) / audio.SR
+
+            rms = float(np.sqrt(np.mean(window_audio ** 2)))
+            if rms < 1e-4:
+                continue
+
+            # 1. Rumble removal (>low_hz) + Formant boost (300-3200 Hz)
+            fft = np.fft.rfft(window_audio)
+            freqs = np.fft.rfftfreq(len(window_audio), 1 / audio.SR)
+            fft[freqs < low_hz] = 0.0
+            if boost_db > 0.0:
+                speech_band = (freqs >= 300.0) & (freqs <= 3200.0)
+                fft[speech_band] *= 10.0 ** (boost_db / 20.0)
+            hp = np.fft.irfft(fft, n=len(window_audio)).astype(np.float32)
+
+            # 2. Candidate enhancements
+            candidates = []
+            try:
+                cfg_g = dict(cfg, robust_denoiser="gtcrn_simple.onnx")
+                candidates.append(("gtcrn", audio.denoise(hp, cfg_g)))
+            except Exception:
+                pass
+            try:
+                cfg_d4 = dict(cfg, robust_denoiser="dpdfnet4.onnx")
+                candidates.append(("dp4", audio.denoise(hp, cfg_d4)))
+            except Exception:
+                pass
+            candidates.append(("hp", hp))
+
+            best_text = ""
+            best_score = -1.0
+
+            for name, audio_cand in candidates:
+                chunk = norm(audio_cand)
+                txts = asr.transcribe(rec, [chunk])
+                txt = txts[0].strip() if txts else ""
+                if txt:
+                    sc, reason = robust.score_coherence(txt, dur)
+                    if sc > best_score:
+                        best_score = sc
+                        best_text = txt
+
+            # If coherent speech was recognized
+            if best_text and best_score > 0.5:
+                curr_words = best_text.split()
+                # Deduplicate against recent history
+                k_max = min(len(emitted_words_history), len(curr_words))
+                overlap = 0
+                for k in range(k_max, 0, -1):
+                    hist_slice = [w.lower().strip(".,?!;:'\"") for w in emitted_words_history[-k:]]
+                    curr_slice = [w.lower().strip(".,?!;:'\"") for w in curr_words[:k]]
+                    if hist_slice == curr_slice:
+                        overlap = k
+                        break
+
+                new_words = curr_words[overlap:]
+                if new_words:
+                    clean_text = " ".join(new_words)
+                    t_start = t_capture - dur
+                    t_end = t_capture
+                    emit(clean_text, t_start, t_end)
+                    emitted_words_history.extend(new_words)
+                    if len(emitted_words_history) > 60:
+                        emitted_words_history = emitted_words_history[-30:]
+
+    worker_th = threading.Thread(target=inference_worker, daemon=True)
+    worker_th.start()
+
+    blocks_since_step = 0
+    raw = []
+    try:
+        for b in block_iter:
+            if args.save:
+                raw.append(b)
+            ring.append(b)
+            blocks_since_step += 1
+            if blocks_since_step >= step_blocks and len(ring) >= max_blocks // 2:
+                blocks_since_step = 0
+                window_data = np.concatenate(list(ring))
+                try:
+                    task_q.put_nowait((window_data, time.time()))
+                except queue.Full:
+                    try:
+                        task_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    task_q.put_nowait((window_data, time.time()))
+    finally:
+        stop_event.set()
+        src.stop()
+        task_q.put(None)
+        worker_th.join(timeout=2.0)
+        if args.save and raw:
+            import soundfile as sf
+            sf.write(args.save, np.concatenate(raw), audio.SR)
+            print(f"[stt] saved raw audio to {args.save}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- Termux:API
 
 def _tmx(cfg: dict) -> str:
@@ -328,6 +466,7 @@ def capture_termux(cfg: dict, seconds: int) -> np.ndarray:
 
 
 def run_termux(cfg: dict, args, emit):
+    subnoise = getattr(args, "subnoise", False)
     level = args.aggressiveness if args.aggressiveness is not None else (3 if args.robust else int(cfg["aggressiveness"]))
     rec = asr.offline(cfg, args.model, args.threads)
     q: queue.Queue = queue.Queue(maxsize=4)
@@ -339,8 +478,12 @@ def run_termux(cfg: dict, args, emit):
             if item is None:
                 return
             samples, t0 = item
-            for s, e, text in robust.transcribe(rec, samples, cfg, level):
-                emit(text, t0 + s, t0 + e)
+            if subnoise:
+                for s, e, text in robust.subnoise_transcribe(rec, samples, cfg):
+                    emit(text, t0 + s, t0 + e)
+            else:
+                for s, e, text in robust.transcribe(rec, samples, cfg, level):
+                    emit(text, t0 + s, t0 + e)
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()
