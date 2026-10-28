@@ -46,6 +46,7 @@ stt doctor
 A default config is written to `~/.config/stt/config.toml` on Linux/Android and `%APPDATA%\stt\config.toml` on Windows on first run; every key is documented inline.
 
 ## Modes
+- **`stt ui`** — launch graphical web front-end with file/folder picker, drag-and-drop, streaming text box, parameter sliders, and keyboard hotkeys.
 - **`stt file`** — ffmpeg decode (any format) -> Silero VAD -> Parakeet.
 - **`stt file <folder> -r`** — recursive batch processing across folders/subdirectories for all `.wav`, `.mp3`, `.m4a`, `.flac`, etc.
 - **`stt file --subnoise`** — high-pass rumble removal (<120Hz) + multi-model denoising (GTCRN + DPDFNet4) + sliding window formant scanning. Uncovers quiet and distant speech buried at or below the ambient noise floor.

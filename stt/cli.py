@@ -327,6 +327,11 @@ def cmd_mic(args, cfg):
                 sys.exit(1)
 
 
+def cmd_ui(args, cfg):
+    from . import ui
+    ui.launch_ui(cfg, host=args.host, port=args.port, open_browser=not args.no_browser)
+
+
 def cmd_doctor(args, cfg):
     from . import mic
 
@@ -399,6 +404,12 @@ def main(argv=None):
     m.add_argument("--debug", action="store_true", help="print mic level / AGC gain / VAD state once a second (pulse backend)")
     _common(m)
     m.set_defaults(fn=cmd_mic)
+
+    u = sub.add_parser("ui", help="launch graphical web front-end with file picker and hotkeys")
+    u.add_argument("--host", default="127.0.0.1", help="server listen address (default 127.0.0.1)")
+    u.add_argument("--port", type=int, default=8080, help="server listen port (default 8080)")
+    u.add_argument("--no-browser", action="store_true", help="do not auto-open browser on launch")
+    u.set_defaults(fn=cmd_ui)
 
     d = sub.add_parser("doctor", help="check dependencies, models, mic backends")
     d.set_defaults(fn=cmd_doctor)
