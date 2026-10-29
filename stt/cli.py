@@ -91,6 +91,36 @@ def _lang_note(args):
         print(f"note: --lang {args.lang} ignored (selected models auto-detect / are English-only)", file=sys.stderr)
 
 
+def format_timestamp_srt(seconds: float) -> str:
+    millis = int(round(seconds * 1000))
+    hours, remainder = divmod(millis, 3600000)
+    minutes, remainder = divmod(remainder, 60000)
+    secs, ms = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def format_timestamp_vtt(seconds: float) -> str:
+    millis = int(round(seconds * 1000))
+    hours, remainder = divmod(millis, 3600000)
+    minutes, remainder = divmod(remainder, 60000)
+    secs, ms = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+def format_srt(triples: list[tuple[float, float, str]]) -> str:
+    blocks = []
+    for idx, (s, e, text) in enumerate(triples, 1):
+        blocks.append(f"{idx}\n{format_timestamp_srt(s)} --> {format_timestamp_srt(e)}\n{text}\n")
+    return "\n".join(blocks)
+
+
+def format_vtt(triples: list[tuple[float, float, str]]) -> str:
+    blocks = ["WEBVTT\n"]
+    for idx, (s, e, text) in enumerate(triples, 1):
+        blocks.append(f"{idx}\n{format_timestamp_vtt(s)} --> {format_timestamp_vtt(e)}\n{text}\n")
+    return "\n".join(blocks)
+
+
 def make_progress_bar():
     start_time = time.time()
     def progress_cb(current_step, total_steps, current_sec, total_sec):
@@ -259,13 +289,37 @@ def cmd_file(args, cfg):
             if args.verbose:
                 print(f"{path}: {dur:.1f}s audio, {dt:.2f}s processing, RTF {dt / max(dur, 1e-9):.3f}", file=sys.stderr)
 
-            lines = []
-            for s, e, text in triples:
-                if args.jsonl:
-                    out.write(json.dumps({"file": path, "start": round(s, 2), "end": round(e, 2), "text": text}, ensure_ascii=False) + "\n")
+            if getattr(args, "sidecar", False):
+                p_obj = Path(path)
+                if getattr(args, "srt", False):
+                    sidecar_path = p_obj.with_suffix(".srt")
+                    sidecar_path.write_text(format_srt(triples), encoding="utf-8")
+                elif getattr(args, "vtt", False):
+                    sidecar_path = p_obj.with_suffix(".vtt")
+                    sidecar_path.write_text(format_vtt(triples), encoding="utf-8")
+                elif getattr(args, "jsonl", False):
+                    sidecar_path = p_obj.with_suffix(".jsonl")
+                    jlines = [json.dumps({"file": path, "start": round(s, 2), "end": round(e, 2), "text": text}, ensure_ascii=False) for s, e, text in triples]
+                    sidecar_path.write_text("\n".join(jlines) + "\n", encoding="utf-8")
                 else:
-                    lines.append(text)
-            if not args.jsonl:
+                    sidecar_path = p_obj.with_suffix(".txt")
+                    sidecar_path.write_text(" ".join(t for _, _, t in triples) + "\n", encoding="utf-8")
+                if args.verbose:
+                    print(f"[stt] saved sidecar: {sidecar_path}", file=sys.stderr)
+
+            if getattr(args, "srt", False):
+                if total_files > 1 and not args.out:
+                    out.write(f"== {path}\n")
+                out.write(format_srt(triples))
+            elif getattr(args, "vtt", False):
+                if total_files > 1 and not args.out:
+                    out.write(f"== {path}\n")
+                out.write(format_vtt(triples))
+            elif getattr(args, "jsonl", False):
+                for s, e, text in triples:
+                    out.write(json.dumps({"file": path, "start": round(s, 2), "end": round(e, 2), "text": text}, ensure_ascii=False) + "\n")
+            else:
+                lines = [t for _, _, t in triples]
                 if total_files > 1:
                     out.write(f"== {path}\n")
                 if lines:
@@ -390,6 +444,9 @@ def main(argv=None):
     f.add_argument("paths", nargs="+", help="audio/video file or directory paths")
     f.add_argument("-r", "--recursive", action="store_true", help="recursively search directories for audio/video files")
     f.add_argument("--jsonl", action="store_true", help="JSON lines with start/end/text")
+    f.add_argument("--srt", action="store_true", help="output standard SubRip (.srt) subtitles")
+    f.add_argument("--vtt", action="store_true", help="output WebVTT (.vtt) subtitles")
+    f.add_argument("--sidecar", action="store_true", help="save sidecar subtitle/transcript file next to each input file (e.g. video.mp4 -> video.srt)")
     f.add_argument("--out", help="write output to this file")
     f.add_argument("-v", "--verbose", action="store_true", help="print timing / real-time factor to stderr")
     _common(f)

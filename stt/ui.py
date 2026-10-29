@@ -352,6 +352,90 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(255,255,255,0.02);
   }
 
+  /* Audio Sync & Interactive Cues */
+  .audio-wrap {
+    padding: 10px 18px;
+    background: var(--code-bg);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .audio-wrap-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .audio-player {
+    width: 100%;
+    height: 36px;
+    outline: none;
+  }
+  .view-switcher {
+    display: inline-flex;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px;
+    margin-right: 8px;
+  }
+  .view-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 3px 10px;
+    font-size: 0.78rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .view-btn.active {
+    background: var(--accent);
+    color: white;
+  }
+  .segments-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 250px;
+    background: var(--code-bg);
+  }
+  .segment-item {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    background: rgba(255,255,255,0.015);
+    border-left: 3px solid transparent;
+    transition: all 0.15s ease;
+  }
+  .segment-item:hover {
+    background: var(--bg-card-hover);
+    border-left-color: var(--accent-hover);
+  }
+  .segment-item.active {
+    background: var(--accent-glow);
+    border-left-color: var(--accent);
+  }
+  .seg-time {
+    font-family: monospace;
+    font-size: 0.78rem;
+    color: var(--accent);
+    flex-shrink: 0;
+    user-select: none;
+  }
+  .seg-text {
+    color: var(--text-main);
+    line-height: 1.5;
+    font-size: 0.93rem;
+  }
+
   /* Modal */
   .modal-overlay {
     position: fixed;
@@ -529,7 +613,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <!-- Output Textbox Card -->
     <div class="output-card">
       <div class="output-header">
-        <h3 id="outputHeading">Transcription Output</h3>
+        <div style="display:flex; align-items:center;">
+          <h3 id="outputHeading" style="margin-right:12px;">Transcript</h3>
+          <div class="view-switcher">
+            <button class="view-btn active" id="btnViewText">Text</button>
+            <button class="view-btn" id="btnViewSegments">Interactive Cues</button>
+          </div>
+        </div>
         <div class="output-actions">
           <button class="btn btn-outline btn-sm" id="btnCopy" title="Copy to Clipboard (Alt+C)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
@@ -544,12 +634,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button class="btn btn-outline btn-sm" id="btnExportSrt" title="Export Subtitle SRT">
             SRT
           </button>
+          <button class="btn btn-outline btn-sm" id="btnExportVtt" title="Export Subtitle VTT">
+            VTT
+          </button>
           <button class="btn btn-outline btn-sm btn-danger" id="btnClear" title="Clear Text (Alt+X)">
             Clear
           </button>
         </div>
       </div>
+
+      <!-- Audio Player Bar (Audio Sync) -->
+      <div class="audio-wrap" id="audioWrap" style="display:none;">
+        <div class="audio-wrap-header">
+          <span id="audioTrackName">Audio Player</span>
+          <span id="audioCurrentTime">00:00 / 00:00</span>
+        </div>
+        <audio id="audioPlayer" class="audio-player" controls preload="metadata"></audio>
+      </div>
+
       <textarea id="output" placeholder="Transcription text will stream here in real time..."></textarea>
+      <div id="segmentsList" class="segments-list" style="display:none;"></div>
       <div class="output-footer">
         <span id="wordStats">0 words | 0 characters</span>
         <span id="procStats">Ready</span>
@@ -566,6 +670,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="btn btn-outline btn-sm" id="btnCloseModal">✕</button>
     </h3>
     <table class="hotkey-table">
+      <tr><td><kbd>Space</kbd></td><td>Play / Pause Audio</td></tr>
+      <tr><td><kbd>Alt+←</kbd> / <kbd>Alt+→</kbd></td><td>Seek Audio -5s / +5s</td></tr>
       <tr><td><kbd>Ctrl+O</kbd> / <kbd>Alt+O</kbd></td><td>Open File Picker</td></tr>
       <tr><td><kbd>Ctrl+D</kbd> / <kbd>Alt+D</kbd></td><td>Open Folder / Directory Picker</td></tr>
       <tr><td><kbd>Ctrl+Enter</kbd></td><td>Start Transcription</td></tr>
@@ -590,6 +696,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const folderInput = document.getElementById('folderInput');
   const serverPath = document.getElementById('serverPath');
   const output = document.getElementById('output');
+  const segmentsList = document.getElementById('segmentsList');
+  const btnViewText = document.getElementById('btnViewText');
+  const btnViewSegments = document.getElementById('btnViewSegments');
+  const audioWrap = document.getElementById('audioWrap');
+  const audioPlayer = document.getElementById('audioPlayer');
+  const audioTrackName = document.getElementById('audioTrackName');
+  const audioCurrentTime = document.getElementById('audioCurrentTime');
   const wordStats = document.getElementById('wordStats');
   const procStats = document.getElementById('procStats');
   const reasoningBox = document.getElementById('reasoningBox');
@@ -600,6 +713,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const progFile = document.getElementById('progFile');
   const progTime = document.getElementById('progTime');
   const progSpeed = document.getElementById('progSpeed');
+
+  function formatSec(s) {
+    if (isNaN(s)) return "00:00";
+    const m = Math.floor(s / 60);
+    const sec = (s % 60).toFixed(1);
+    return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(4, '0')}`;
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // View Switcher
+  btnViewText.onclick = () => {
+    btnViewText.classList.add('active');
+    btnViewSegments.classList.remove('active');
+    output.style.display = 'block';
+    segmentsList.style.display = 'none';
+  };
+  btnViewSegments.onclick = () => {
+    btnViewSegments.classList.add('active');
+    btnViewText.classList.remove('active');
+    output.style.display = 'none';
+    segmentsList.style.display = 'flex';
+  };
+
+  // Audio Player Sync
+  audioPlayer.ontimeupdate = () => {
+    const cur = audioPlayer.currentTime;
+    const dur = audioPlayer.duration || 0;
+    audioCurrentTime.textContent = `${formatSec(cur)} / ${formatSec(dur)}`;
+    const items = segmentsList.querySelectorAll('.segment-item');
+    items.forEach(el => {
+      const s = parseFloat(el.dataset.start);
+      const e = parseFloat(el.dataset.end);
+      if (cur >= s && cur <= e) {
+        el.classList.add('active');
+      } else {
+        el.classList.remove('active');
+      }
+    });
+  };
 
   // Sliders
   const rumbleCutoff = document.getElementById('rumbleCutoff');
@@ -626,6 +783,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     selectedFiles = files;
     serverPath.value = "";
     procStats.textContent = `${files.length} file(s) selected: ${files.map(f => f.name).slice(0, 3).join(', ')}${files.length > 3 ? '...' : ''}`;
+    
+    // Mount first file to audio player for instant playback
+    audioPlayer.src = URL.createObjectURL(files[0]);
+    audioTrackName.textContent = files[0].name;
+    audioWrap.style.display = 'flex';
   }
 
   // Drag and drop
@@ -650,6 +812,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return;
     }
 
+    if (pathVal) {
+      const fileName = pathVal.replace(/^.*[\\\/]/, '');
+      audioPlayer.src = `/api/audio?path=${encodeURIComponent(pathVal)}`;
+      audioTrackName.textContent = fileName || pathVal;
+      audioWrap.style.display = 'flex';
+    }
+
     const payload = {
       strategy: document.getElementById('strategy').value,
       rumble_cutoff: parseFloat(rumbleCutoff.value),
@@ -666,6 +835,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     progressWrap.style.display = 'block';
     segmentsHistory = [];
     output.value = "";
+    segmentsList.innerHTML = "";
     updateStats();
 
     if (selectedFiles.length && !pathVal) {
@@ -735,6 +905,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
               }
               output.value += data.text;
               output.scrollTop = output.scrollHeight;
+
+              // Append interactive cue item
+              const segEl = document.createElement('div');
+              segEl.className = 'segment-item';
+              segEl.dataset.start = data.start;
+              segEl.dataset.end = data.end;
+              segEl.innerHTML = `<span class="seg-time">${formatSec(data.start)} → ${formatSec(data.end)}</span><span class="seg-text">${escapeHtml(data.text)}</span>`;
+              segEl.onclick = () => {
+                audioPlayer.currentTime = data.start;
+                audioPlayer.play();
+              };
+              segmentsList.appendChild(segEl);
+
               updateStats();
             } else if (eventType === "done") {
               procStats.textContent = `Completed in ${data.elapsed.toFixed(1)}s (RTF: ${data.rtf.toFixed(2)}x)`;
@@ -768,6 +951,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   // Clear
   document.getElementById('btnClear').onclick = () => {
     output.value = "";
+    segmentsList.innerHTML = "";
     segmentsHistory = [];
     updateStats();
   };
@@ -794,6 +978,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     downloadFile("transcript.srt", srt, "text/plain");
   };
 
+  // Export VTT
+  document.getElementById('btnExportVtt').onclick = () => {
+    let vtt = "WEBVTT\n\n";
+    segmentsHistory.forEach((seg, idx) => {
+      const formatTime = (sec) => {
+        const d = new Date(sec * 1000);
+        return d.toISOString().substr(11, 8) + "." + ("00" + d.getMilliseconds()).slice(-3);
+      };
+      vtt += `${idx + 1}\n${formatTime(seg.start)} --> ${formatTime(seg.end)}\n${seg.text}\n\n`;
+    });
+    downloadFile("transcript.vtt", vtt, "text/vtt");
+  };
+
   function downloadFile(filename, content, type) {
     const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
@@ -814,6 +1011,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
   window.addEventListener('keydown', (e) => {
     const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
     const ctrl = isMac ? e.metaKey : e.ctrlKey;
+
+    if (e.code === 'Space') {
+      if (document.activeElement !== output && document.activeElement !== serverPath) {
+        e.preventDefault();
+        if (audioPlayer.paused) {
+          audioPlayer.play();
+        } else {
+          audioPlayer.pause();
+        }
+      }
+    } else if (e.altKey && e.key === 'ArrowLeft') {
+      e.preventDefault();
+      audioPlayer.currentTime = Math.max(0, audioPlayer.currentTime - 5);
+    } else if (e.altKey && e.key === 'ArrowRight') {
+      e.preventDefault();
+      audioPlayer.currentTime = Math.min(audioPlayer.duration || 0, audioPlayer.currentTime + 5);
+    } else if (e.key === '?' || e.key === 'F1') {
+      if (document.activeElement !== output) {
+        e.preventDefault();
+        modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
+      }
+    } else if (e.key === 'Escape') {
+      modal.style.display = 'none';
+    } else if (ctrl && (e.key === 'o' || e.key === 'O')) {
+      e.preventDefault();
+      fileInput.click();
+    } else if (ctrl && (e.key === 'd' || e.key === 'D')) {
+      e.preventDefault();
+      folderInput.click();
+    } else if (ctrl && e.key === 'Enter') {
+      e.preventDefault();
+      startTranscription();
+    } else if (ctrl && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault();
+      document.getElementById('btnExportTxt').click();
+    } else if (e.altKey && (e.key === 'c' || e.key === 'C')) {
+      e.preventDefault();
+      document.getElementById('btnCopy').click();
+    } else if (e.altKey && (e.key === 'x' || e.key === 'X')) {
+      e.preventDefault();
+      document.getElementById('btnClear').click();
+    } else if (e.altKey && (e.key === 'a' || e.key === 'A')) {
+      e.preventDefault();
+      document.getElementById('strategy').value = 'auto';
+    } else if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+      e.preventDefault();
+      document.getElementById('strategy').value = 'subnoise';
+    }
+  });
+</script>
 
     if (e.key === '?' || e.key === 'F1') {
       if (document.activeElement !== output) {
@@ -884,6 +1131,37 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif parsed.path == "/api/audio":
+            query = urllib.parse.parse_qs(parsed.query)
+            target_path = query.get("path", [None])[0]
+            if not target_path or not Path(target_path).is_file():
+                self.send_error(404, "Audio file not found")
+                return
+            p = Path(target_path)
+            content_type = "audio/wav"
+            suf = p.suffix.lower()
+            if suf in (".mp3",):
+                content_type = "audio/mpeg"
+            elif suf in (".m4a", ".aac"):
+                content_type = "audio/mp4"
+            elif suf in (".ogg", ".opus"):
+                content_type = "audio/ogg"
+            elif suf in (".flac",):
+                content_type = "audio/flac"
+            elif suf in (".mp4", ".mkv", ".webm"):
+                content_type = "video/mp4"
+
+            try:
+                size = p.stat().st_size
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                with open(p, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            except Exception:
+                pass
         else:
             self.send_error(404, "Not Found")
 

@@ -7,9 +7,10 @@ A command-line transcriber built on [sherpa-onnx](https://github.com/k2-fsa/sher
 Fast, No cloud used, no NPU needed, no root needed.
 
 ```
-stt file a.wav talk.mp4 [--jsonl] [--out FILE] [-a 0-5 | --robust | --subnoise] [-v]
+stt file a.wav talk.mp4 [--jsonl] [--srt] [--vtt] [--sidecar] [--out FILE] [-a 0-5 | --robust | --subnoise] [-v]
 stt mic  [--partial] [--backend pulse|windows|termux] [--whisper | --distant] [-a 0-5] [--threads N]
 stt doctor
+stt ui   [--host 127.0.0.1] [--port 8080] [--no-browser]
 stt <cmd> --model list          # installed models by kind;  --model NAME picks one (repeatable)
 ```
 
@@ -46,9 +47,10 @@ stt doctor
 A default config is written to `~/.config/stt/config.toml` on Linux/Android and `%APPDATA%\stt\config.toml` on Windows on first run; every key is documented inline.
 
 ## Modes
-- **`stt ui`** — launch graphical web front-end with file/folder picker, drag-and-drop, streaming text box, parameter sliders, and keyboard hotkeys.
+- **`stt ui`** — launch graphical web front-end with file/folder picker, drag-and-drop, interactive audio playback sync, clickable cue seeking, streaming text box, parameter sliders, and keyboard hotkeys.
 - **`stt file`** — ffmpeg decode (any format) -> Silero VAD -> Parakeet.
 - **`stt file <folder> -r`** — recursive batch processing across folders/subdirectories for all `.wav`, `.mp3`, `.m4a`, `.flac`, etc.
+- **`stt file --srt / --vtt / --sidecar`** — export standard SubRip (`.srt`) or WebVTT (`.vtt`) subtitles; `--sidecar` automatically writes subtitles next to input media files (e.g. `video.mp4` -> `video.srt`).
 - **`stt file --subnoise`** — high-pass rumble removal (<120Hz) + multi-model denoising (GTCRN + DPDFNet4) + sliding window formant scanning. Uncovers quiet and distant speech buried at or below the ambient noise floor.
 - **`stt mic`** — streaming recognizer with VAD endpointing; `--partial` shows interim text.
 - **`stt mic --subnoise`** — live continuous sliding ring-buffer scan with multi-model denoising. Bypasses standard binary VAD thresholds for live acoustic surveillance and listening to faint whispers/sub-noise speech.
@@ -58,6 +60,12 @@ A default config is written to `~/.config/stt/config.toml` on Linux/Android and 
   - `pulse`: private PulseAudio server with the OpenSL ES source (or system default) and `parec`.
   - `windows`: DirectShow capture via `ffmpeg` (`-f dshow`) or PortAudio/WASAPI via `sounddevice`.
   - `termux`: 5 s chunks via Termux:API (`termux-microphone-record`).
+
+## Testing & Quality Assurance
+Run the automated test suite covering configuration, audio pipelines, AGC, spectral subtraction, robustness auto-tuning, subtitle formatting, and web UI API routes:
+```sh
+pytest -v tests/
+```
 
 ## Packaging & Releases
 - **Build PyPI Distribution** (sdist & wheel):
