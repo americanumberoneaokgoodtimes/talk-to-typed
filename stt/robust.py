@@ -137,6 +137,9 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     boost_db = tuned.get("boost_db", 3.5)
     win_len = int(tuned.get("win_sec", 5.0) * audio.SR)
     step = int(tuned.get("step_sec", 2.0) * audio.SR)
+    bp = tuned.get("blank_penalty")
+    if bp is not None:
+        rec = asr.get_offline(cfg, blank_penalty=bp)
 
     # 1. High-pass filter (>low_hz) + Formant boost (300-3200 Hz)
     fft = np.fft.rfft(samples)

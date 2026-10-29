@@ -1,4 +1,5 @@
 """Audio helpers: ffmpeg decoding and Silero VAD segmentation."""
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,10 +11,14 @@ SR = 16000
 
 def decode(path: str) -> np.ndarray:
     """Decode any ffmpeg-readable file to 16 kHz mono float32."""
-    p = subprocess.run(
-        ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-vn", "-f", "f32le", "-ac", "1", "-ar", str(SR), "-"],
-        capture_output=True,
-    )
+    ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe") or "ffmpeg"
+    try:
+        p = subprocess.run(
+            [ffmpeg_bin, "-v", "error", "-nostdin", "-i", path, "-vn", "-f", "f32le", "-ac", "1", "-ar", str(SR), "-"],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg binary not found on PATH. Please install ffmpeg.")
     if p.returncode != 0:
         raise RuntimeError(f"ffmpeg failed on {path}: {p.stderr.decode(errors='replace').strip()}")
     return np.frombuffer(p.stdout, dtype=np.float32)

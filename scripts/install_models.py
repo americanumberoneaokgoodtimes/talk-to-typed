@@ -64,7 +64,10 @@ def install_tarball(url: str, filename: str, target_dir: Path):
     print(f"Extracting {filename}...")
     try:
         with tarfile.open(tar_path, "r:bz2") as tar:
-            tar.extractall(path=target_dir)
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(path=target_dir, filter="data")
+            else:
+                tar.extractall(path=target_dir)
         print(f"OK: {folder_name}")
     finally:
         if tar_path.exists():

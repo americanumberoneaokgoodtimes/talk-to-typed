@@ -220,7 +220,8 @@ def run_pulse_utterance(cfg: dict, args, emit, src=None):
     distant = getattr(args, "distant", False)
     level = args.aggressiveness if args.aggressiveness is not None else (5 if distant else 3 if args.robust or args.whisper else int(cfg["aggressiveness"]))
     level = max(level, 1) if (args.whisper or distant) else level
-    rec = asr.offline(cfg, args.model, args.threads)
+    blank_penalty = getattr(args, "blank_penalty", 0.6)
+    rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
     thr = min(cfg["mic_vad_threshold"], 0.25) if distant else cfg["mic_vad_threshold"]
     vad = audio.make_vad(dict(cfg, vad_threshold=thr, vad_min_speech=cfg["mic_vad_min_speech"]))
     src = src or PulseSource(cfg)
@@ -292,7 +293,8 @@ def run_pulse_subnoise(cfg: dict, args, emit, src=None):
     Designed for acoustic surveillance and continuous listening to faint or sub-noise-floor
     speech, bypassing standard binary VAD thresholds.
     """
-    rec = asr.offline(cfg, args.model, args.threads)
+    blank_penalty = getattr(args, "blank_penalty", 0.6)
+    rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
     src = src or PulseSource(cfg)
     src.start()
 
@@ -468,7 +470,8 @@ def capture_termux(cfg: dict, seconds: int) -> np.ndarray:
 def run_termux(cfg: dict, args, emit):
     subnoise = getattr(args, "subnoise", False)
     level = args.aggressiveness if args.aggressiveness is not None else (3 if args.robust else int(cfg["aggressiveness"]))
-    rec = asr.offline(cfg, args.model, args.threads)
+    blank_penalty = getattr(args, "blank_penalty", 0.6)
+    rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
     q: queue.Queue = queue.Queue(maxsize=4)
     stop = threading.Event()
 

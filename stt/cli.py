@@ -80,6 +80,9 @@ def _common(p):
                    help="interactive parameter wizard with educational guidance before running")
     p.add_argument("--window-size", type=float, help="sliding window length in seconds (subnoise mode)")
     p.add_argument("--step-size", type=float, help="sliding window stride in seconds (subnoise mode)")
+    p.add_argument("--rumble-cutoff", type=float, help="high-pass filter cutoff in Hz (default 120)")
+    p.add_argument("--formant-boost", type=float, help="formant equalization boost in dB (default 3.0)")
+    p.add_argument("--blank-penalty", type=float, help="transducer blank penalty (0.0 to 1.5, default 0.6)")
     p.add_argument("--lang", help="language hint; ignored by models that auto-detect or are English-only")
 
 
@@ -224,15 +227,15 @@ def cmd_file(args, cfg):
 
             if is_auto or getattr(args, "subnoise", False):
                 auto_params = robust.auto_tune_settings(dur)
-                if hasattr(args, "rumble_cutoff"):
-                    auto_params["low_hz"] = args.rumble_cutoff
-                if hasattr(args, "formant_boost"):
-                    auto_params["boost_db"] = args.formant_boost
-                if hasattr(args, "blank_penalty"):
-                    auto_params["blank_penalty"] = args.blank_penalty
-                if getattr(args, "window_size", None):
+                if getattr(args, "rumble_cutoff", None) is not None:
+                    auto_params["low_hz"] = float(args.rumble_cutoff)
+                if getattr(args, "formant_boost", None) is not None:
+                    auto_params["boost_db"] = float(args.formant_boost)
+                if getattr(args, "blank_penalty", None) is not None:
+                    auto_params["blank_penalty"] = float(args.blank_penalty)
+                if getattr(args, "window_size", None) is not None:
                     auto_params["win_sec"] = float(args.window_size)
-                if getattr(args, "step_size", None):
+                if getattr(args, "step_size", None) is not None:
                     auto_params["step_sec"] = float(args.step_size)
 
                 print(f"\n[stt auto-tune] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
@@ -371,7 +374,10 @@ def cmd_doctor(args, cfg):
     w = max(len(r[0]) for r in rows)
     for n, s, d in rows:
         print(f"{n:<{w}}  {s:<4}  {d}")
-    sys.exit(0 if all(s != "FAIL" for _, s, _ in rows) and any_mic else 1)
+    all_ok = all(s != "FAIL" for _, s, _ in rows)
+    if all_ok and not any_mic:
+        print("\nNote: No active microphone backend found. File transcription is fully operational.")
+    sys.exit(0 if all_ok else 1)
 
 
 def main(argv=None):

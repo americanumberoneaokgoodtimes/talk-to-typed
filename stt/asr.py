@@ -32,11 +32,25 @@ def _model_type(d: Path) -> str:
     return "nemo_transducer" if "nemo" in d.name else ""
 
 
-def offline(cfg: dict, model: str | None = None, threads: int | None = None):
+_offline_cache: dict = {}
+
+
+def offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
     d = _resolve(cfg, model, "offline_model")
+    kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
+    if blank_penalty is not None:
+        kwargs["blank_penalty"] = float(blank_penalty)
     return sherpa_onnx.OfflineRecognizer.from_transducer(
-        **_files(d), num_threads=threads or cfg["threads"], model_type=_model_type(d)
+        **_files(d), **kwargs
     )
+
+
+def get_offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
+    bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
+    key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key)
+    if key not in _offline_cache:
+        _offline_cache[key] = offline(cfg, model=model, threads=threads, blank_penalty=blank_penalty)
+    return _offline_cache[key]
 
 
 def streaming(cfg: dict, model: str | None = None, threads: int | None = None):

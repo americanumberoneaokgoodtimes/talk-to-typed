@@ -990,15 +990,15 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
 
             if is_subnoise:
                 params = robust.auto_tune_settings(dur)
-                if req.get("rumble_cutoff"):
+                if req.get("rumble_cutoff") is not None:
                     params["low_hz"] = float(req["rumble_cutoff"])
-                if req.get("formant_boost"):
+                if req.get("formant_boost") is not None:
                     params["boost_db"] = float(req["formant_boost"])
-                if req.get("blank_penalty"):
+                if req.get("blank_penalty") is not None:
                     params["blank_penalty"] = float(req["blank_penalty"])
-                if req.get("window_size"):
+                if req.get("window_size") is not None:
                     params["win_sec"] = float(req["window_size"])
-                if req.get("step_size"):
+                if req.get("step_size") is not None:
                     params["step_sec"] = float(req["step_size"])
 
                 send_sse("reasoning", {"file": disp_name, "duration": dur, "reasons": params["reasoning"]})
