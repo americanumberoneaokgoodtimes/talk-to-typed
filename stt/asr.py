@@ -1,4 +1,5 @@
 """Recognizer construction. Model dirs hold encoder/decoder/joiner .onnx + tokens.txt."""
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -28,11 +29,16 @@ def _files(d: Path) -> dict:
 
 
 def _model_type(d: Path) -> str:
-    """NeMo/Nemotron exports need model_type nemo_transducer; plain zipformer transducers (e.g. kroko) use the default."""
-    return "nemo_transducer" if "nemo" in d.name else ""
+    """NeMo/Nemotron exports need model_type nemo_transducer; plain zipformer transducers (e.g. kroko) use the default.
+    
+    Detection is based on directory name convention from sherpa-onnx releases.
+    NeMo models have 'nemo' in their release name (e.g., sherpa-onnx-nemo-parakeet-*, sherpa-onnx-nemotron-*).
+    """
+    return "nemo_transducer" if "nemo" in d.name.lower() else ""
 
 
 _offline_cache: dict = {}
+_offline_cache_lock = threading.Lock()
 
 
 def offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
@@ -48,9 +54,10 @@ def offline(cfg: dict, model: str | None = None, threads: int | None = None, bla
 def get_offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
     bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
     key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key)
-    if key not in _offline_cache:
-        _offline_cache[key] = offline(cfg, model=model, threads=threads, blank_penalty=blank_penalty)
-    return _offline_cache[key]
+    with _offline_cache_lock:
+        if key not in _offline_cache:
+            _offline_cache[key] = offline(cfg, model=model, threads=threads, blank_penalty=blank_penalty)
+        return _offline_cache[key]
 
 
 def streaming(cfg: dict, model: str | None = None, threads: int | None = None):
@@ -79,6 +86,8 @@ def catalog(cfg: dict) -> list[dict]:
     """Installed models under models_dir: [{name, kind, size_mb, active}]."""
     out = []
     md = Path(cfg["models_dir"])
+    if not md.exists():
+        return out
     for p in sorted(md.iterdir()):
         if p.is_dir() and (p / "tokens.txt").exists():
             kind = "asr-streaming" if "streaming" in p.name else "asr-offline"
@@ -96,6 +105,8 @@ def catalog(cfg: dict) -> list[dict]:
 
 def format_catalog(cfg: dict) -> str:
     rows = catalog(cfg)
+    if not rows:
+        return f"(no models found in {cfg['models_dir']} — run scripts/install_models.sh or .ps1)"
     w = max(len(r["name"]) for r in rows)
     lines = [f"{'':2}{'NAME':<{w}}  {'KIND':<14}SIZE"]
     for r in sorted(rows, key=lambda r: (r["kind"], r["name"])):

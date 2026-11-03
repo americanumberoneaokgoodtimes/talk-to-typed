@@ -1,6 +1,7 @@
 """Audio helpers: ffmpeg decoding and Silero VAD segmentation."""
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +32,7 @@ def make_vad(cfg: dict, min_silence: float | None = None):
     c.silero_vad.min_silence_duration = min_silence if min_silence is not None else cfg["vad_min_silence"]
     c.silero_vad.min_speech_duration = cfg["vad_min_speech"]
     c.silero_vad.max_speech_duration = cfg["vad_max_speech"]
-    c.silero_vad.window_size = 512
+    c.silero_vad.window_size = cfg.get("vad_window_size", 512)
     c.sample_rate = SR
     c.num_threads = 1
     return sherpa_onnx.VoiceActivityDetector(c, buffer_size_in_seconds=60)
@@ -40,7 +41,7 @@ def make_vad(cfg: dict, min_silence: float | None = None):
 def segments(samples: np.ndarray, cfg: dict):
     """Yield (start_sec, end_sec, samples) speech segments."""
     vad = make_vad(cfg)
-    w = 512
+    w = cfg.get("vad_window_size", 512)
 
     def drain():
         while not vad.empty():
@@ -59,33 +60,50 @@ def segments(samples: np.ndarray, cfg: dict):
 
 
 _denoisers: dict = {}
+_denoisers_lock = threading.Lock()
 
 
 def denoise(samples: np.ndarray, cfg: dict, noise: "NoiseProfile | None" = None) -> np.ndarray:
-    """Neural speech denoiser (DPDFNet), run in 30 s blocks to bound memory.
+    """Neural speech denoiser (DPDFNet), run in 30 s blocks with overlap to bound memory and avoid boundary artifacts.
 
     With a calibrated `noise` profile, a clip of the real room noise is prepended as context and dropped afterwards.
     """
     key = (cfg["robust_denoiser"], cfg["threads"])
-    if key not in _denoisers:
-        c = sherpa_onnx.OfflineSpeechDenoiserConfig()
-        path = str(Path(cfg["models_dir"]) / cfg["robust_denoiser"])
-        if cfg["robust_denoiser"].startswith("gtcrn"):
-            c.model.gtcrn.model = path
-        else:
-            c.model.dpdfnet.model = path
-            c.model.dpdfnet.attenuation_limit_db = 100.0
-        c.model.num_threads = min(cfg["threads"], 2)
-        _denoisers[key] = sherpa_onnx.OfflineSpeechDenoiser(c)
-    d = _denoisers[key]
+    with _denoisers_lock:
+        if key not in _denoisers:
+            c = sherpa_onnx.OfflineSpeechDenoiserConfig()
+            path = str(Path(cfg["models_dir"]) / cfg["robust_denoiser"])
+            if cfg["robust_denoiser"].startswith("gtcrn"):
+                c.model.gtcrn.model = path
+            else:
+                c.model.dpdfnet.model = path
+                c.model.dpdfnet.attenuation_limit_db = 100.0
+            c.model.num_threads = min(cfg["threads"], 2)
+            _denoisers[key] = sherpa_onnx.OfflineSpeechDenoiser(c)
+        d = _denoisers[key]
     block = 30 * SR
+    # 1 s of lookahead context fed to the denoiser so the model can better denoise the
+    # end of each block; the lookahead output is discarded (next block will process it properly).
+    lookahead = SR
     parts = []
     lead = noise.clip if noise is not None else np.zeros(0, np.float32)
+
     for i in range(0, len(samples), block):
-        x = samples[i : i + block]
+        end = min(i + block + lookahead, len(samples))
+        x = samples[i:end]
         y = np.asarray(d.run(np.concatenate([lead, x]), SR).samples, dtype=np.float32)[len(lead):]
-        parts.append(np.pad(y, (0, max(0, len(x) - len(y))))[: len(x)])
-    return np.concatenate(parts) if parts else samples
+        # Keep only the block-length output; the lookahead improves boundary quality but is
+        # reprocessed by the next block, so we don't include it here.
+        if end < len(samples):
+            y = y[:block]
+        parts.append(y)
+        lead = np.zeros(0, np.float32)  # noise lead used only for the first block
+
+    out = np.concatenate(parts) if parts else samples
+    # Denoiser frame-alignment can produce a slightly shorter output; pad to match input.
+    if len(out) < len(samples):
+        out = np.pad(out, (0, len(samples) - len(out)))
+    return out[:len(samples)]
 
 
 def normalize(x: np.ndarray, peak: float = 0.7) -> np.ndarray:
@@ -105,7 +123,7 @@ class AGC:
         self.target, self.max_gain, self.noise_cap = target, max_gain, noise_cap
         self.nf = noise_floor  # a calibrated floor skips the slow learning phase
         self.env = 1e-3  # assume quiet until speech is heard; gain ramps up slowly from 1
-        self.gain = 1.0 if noise_floor is None else float(min(max_gain, noise_cap / max(noise_floor, 1e-5), 10.0))
+        self.gain = 1.0 if noise_floor is None else float(min(max_gain, noise_cap / max(noise_floor, 1e-5)))
 
     def __call__(self, b: np.ndarray) -> np.ndarray:
         r = float(np.sqrt(np.mean(b * b))) + 1e-7

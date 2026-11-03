@@ -18,8 +18,13 @@ from . import asr, audio, robust
 
 BLOCK = 512  # samples per VAD window (32 ms)
 
+# Port management for PulseAudio
+_PULSE_PORT_RANGE = range(4714, 4725)  # Try ports 4714-4724
+_PULSE_LOCK_DIR = Path(tempfile.gettempdir()) / "stt_pulse_locks"
+_PULSE_LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
-def _which(cfg: dict, name: str) -> str | None:
+
+def which(cfg: dict, name: str) -> str | None:
     # Only Termux's pulseaudio ships module-sles-source (the phone mic); Kali's does not.
     t = Path(cfg["termux_bin"]) / name
     if name == "pulseaudio":
@@ -38,6 +43,64 @@ def _kill(p: subprocess.Popen | None):
         p.wait()
 
 
+def _acquire_pulse_port(cfg: dict) -> int:
+    """Find and lock an available PulseAudio port."""
+    for port in _PULSE_PORT_RANGE:
+        lock_file = _PULSE_LOCK_DIR / f"port_{port}.lock"
+        try:
+            # Try to create lock file exclusively
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'w') as f:
+                f.write(str(os.getpid()))
+            # Verify port is actually free by trying to bind
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                try:
+                    sock.bind(('127.0.0.1', port))
+                    cfg['pulse_port'] = port
+                    return port
+                except OSError:
+                    # Port in use, release lock and try next
+                    lock_file.unlink(missing_ok=True)
+                    continue
+        except FileExistsError:
+            # Lock exists, check if process is alive
+            try:
+                with open(lock_file) as f:
+                    pid = int(f.read().strip())
+                # Check if process exists
+                os.kill(pid, 0)  # Signal 0 just checks existence
+                # Process alive, port likely in use
+                continue
+            except (ValueError, ProcessLookupError, OSError):
+                # Stale lock, remove and try
+                lock_file.unlink(missing_ok=True)
+                fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, 'w') as f:
+                    f.write(str(os.getpid()))
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    try:
+                        sock.bind(('127.0.0.1', port))
+                        cfg['pulse_port'] = port
+                        return port
+                    except OSError:
+                        lock_file.unlink(missing_ok=True)
+                        continue
+    raise RuntimeError("No available PulseAudio ports in range 4714-4724")
+
+
+def _release_pulse_port(port: int):
+    """Release the port lock."""
+    lock_file = _PULSE_LOCK_DIR / f"port_{port}.lock"
+    try:
+        lock_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- PulseAudio
 
 class PulseSource:
@@ -45,28 +108,46 @@ class PulseSource:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.server = f"tcp:127.0.0.1:{cfg['pulse_port']}"
+        self._port = _acquire_pulse_port(cfg)
+        self.server = f"tcp:127.0.0.1:{self._port}"
         self.env = dict(os.environ, PULSE_SERVER=self.server)
         self.pa: subprocess.Popen | None = None
         self.rec: subprocess.Popen | None = None
+        # Register cleanup; only install signal handlers if the caller hasn't set custom ones
+        # (cli.py converts SIGTERM→KeyboardInterrupt so finally blocks run to save --save WAV)
+        atexit.register(self._cleanup)
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        if signal.getsignal(signal.SIGINT) is signal.SIG_DFL:
+            signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        self._cleanup()
+        sys.exit(1)
+
+    def _cleanup(self):
+        _kill(self.rec)
+        _kill(self.pa)
+        self.rec = self.pa = None
+        _release_pulse_port(self._port)
 
     def _sources(self) -> str:
-        pactl = _which(self.cfg, "pactl")
+        pactl = which(self.cfg, "pactl")
         if not pactl:
             return ""
         r = subprocess.run([pactl, "list", "short", "sources"], env=self.env, capture_output=True, text=True, timeout=5)
         return r.stdout if r.returncode == 0 else ""
 
     def start(self):
-        if not _which(self.cfg, "parec"):
+        if not which(self.cfg, "parec"):
             raise RuntimeError("parec not found")
         if "OpenSL_ES_source" not in self._sources():
-            pa = _which(self.cfg, "pulseaudio")
+            pa = which(self.cfg, "pulseaudio")
             if not pa:
                 raise RuntimeError("pulseaudio binary not found")
             self.pa = subprocess.Popen(
                 [pa, "-n", "--daemonize=no", "--exit-idle-time=-1", "--use-pid-file=no", "--log-target=null",
-                 "--load=module-native-protocol-tcp port=%d auth-anonymous=1 listen=127.0.0.1" % self.cfg["pulse_port"],
+                 "--load=module-native-protocol-tcp port=%d auth-anonymous=1 listen=127.0.0.1" % self._port,
                  "--load=module-sles-source"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             )
@@ -80,7 +161,7 @@ class PulseSource:
                 self.stop()
                 raise RuntimeError("OpenSL_ES_source did not appear (mic permission?)")
         self.rec = subprocess.Popen(
-            [_which(self.cfg, "parec"), "--format=s16le", "--rate=16000", "--channels=1", "--raw",
+            [which(self.cfg, "parec"), "--format=s16le", "--rate=16000", "--channels=1", "--raw",
              "--device=OpenSL_ES_source", "--latency-msec=20"],
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, bufsize=0,
         )
@@ -138,7 +219,11 @@ def capture_pulse(cfg: dict, seconds: float) -> np.ndarray:
 
 
 def run_pulse(cfg: dict, args, emit, src=None):
+    if not args.jsonl:
+        print("[stt] Loading streaming model...", file=sys.stderr, flush=True)
     rec = asr.streaming(cfg, args.model, args.threads)
+    if not args.jsonl:
+        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     vad = audio.make_vad(dict(cfg, vad_threshold=cfg['mic_vad_threshold'], vad_min_speech=cfg['mic_vad_min_speech']))
     src = src or PulseSource(cfg)
     src.start()
@@ -221,8 +306,17 @@ def run_pulse_utterance(cfg: dict, args, emit, src=None):
     level = args.aggressiveness if args.aggressiveness is not None else (5 if distant else 3 if args.robust or args.whisper else int(cfg["aggressiveness"]))
     level = max(level, 1) if (args.whisper or distant) else level
     blank_penalty = getattr(args, "blank_penalty", 0.6)
+    if not args.jsonl:
+        print("[stt] Loading offline model...", file=sys.stderr, flush=True)
     rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
-    thr = min(cfg["mic_vad_threshold"], 0.25) if distant else cfg["mic_vad_threshold"]
+    if not args.jsonl:
+        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
+    if distant:
+        thr = cfg.get("mic_vad_threshold_distant", 0.20)
+    elif args.whisper:
+        thr = cfg.get("mic_vad_threshold_whisper", 0.25)
+    else:
+        thr = cfg["mic_vad_threshold"]
     vad = audio.make_vad(dict(cfg, vad_threshold=thr, vad_min_speech=cfg["mic_vad_min_speech"]))
     src = src or PulseSource(cfg)
     src.start()
@@ -294,7 +388,11 @@ def run_pulse_subnoise(cfg: dict, args, emit, src=None):
     speech, bypassing standard binary VAD thresholds.
     """
     blank_penalty = getattr(args, "blank_penalty", 0.6)
+    if not args.jsonl:
+        print("[stt] Loading offline model...", file=sys.stderr, flush=True)
     rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
+    if not args.jsonl:
+        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     src = src or PulseSource(cfg)
     src.start()
 
@@ -348,14 +446,16 @@ def run_pulse_subnoise(cfg: dict, args, emit, src=None):
             try:
                 cfg_g = dict(cfg, robust_denoiser="gtcrn_simple.onnx")
                 candidates.append(("gtcrn", audio.denoise(hp, cfg_g)))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[stt] Warning: GTCRN denoiser unavailable: {e}", file=sys.stderr)
             try:
                 cfg_d4 = dict(cfg, robust_denoiser="dpdfnet4.onnx")
                 candidates.append(("dp4", audio.denoise(hp, cfg_d4)))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[stt] Warning: DPDFNet4 denoiser unavailable: {e}", file=sys.stderr)
             candidates.append(("hp", hp))
+            if len(candidates) == 1:
+                print("[stt] Warning: No neural denoisers available; using high-pass only", file=sys.stderr)
 
             best_text = ""
             best_score = -1.0
@@ -429,7 +529,7 @@ def run_pulse_subnoise(cfg: dict, args, emit, src=None):
 # ---------------------------------------------------------------- Termux:API
 
 def _tmx(cfg: dict) -> str:
-    p = _which(cfg, "termux-microphone-record")
+    p = which(cfg, "termux-microphone-record")
     if not p:
         raise RuntimeError("termux-microphone-record not found")
     return p
@@ -441,19 +541,47 @@ def record_chunk(cfg: dict, seconds: int) -> Path | None:
     tmp.mkdir(parents=True, exist_ok=True)
     f = tmp / f"chunk-{os.getpid()}-{time.monotonic_ns()}.m4a"
     cmd = _tmx(cfg)
-    r = subprocess.run([cmd, "-f", str(f), "-l", str(seconds), "-e", "aac", "-r", "16000", "-c", "1"],
-                       capture_output=True, text=True, timeout=30)
-    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
-        raise RuntimeError((r.stdout + r.stderr).strip() or "termux-microphone-record failed")
-    deadline = time.time() + seconds + 6
+    
+    # Retry with exponential backoff for first-call-after-idle slowness
+    max_retries = 3
+    base_timeout = 30
+    for attempt in range(max_retries):
+        try:
+            timeout = base_timeout * (2 ** attempt)  # 30s, 60s, 120s
+            r = subprocess.run([cmd, "-f", str(f), "-l", str(seconds), "-e", "aac", "-r", "16000", "-c", "1"],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0 and "error" not in (r.stdout + r.stderr).lower():
+                break
+            last_error = (r.stdout + r.stderr).strip()
+        except subprocess.TimeoutExpired:
+            last_error = f"timeout after {timeout}s"
+        except Exception as e:
+            last_error = str(e)
+        
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 1s, 2s
+            time.sleep(wait_time)
+    else:
+        raise RuntimeError(f"termux-microphone-record failed after {max_retries} attempts: {last_error}")
+    
+    # Wait for recording to complete with generous deadline
+    deadline = time.time() + seconds + 30  # Increased from 6 to 30 seconds buffer
     time.sleep(0.5)
     while time.time() < deadline:
-        info = subprocess.run([cmd, "-i"], capture_output=True, text=True, timeout=30).stdout
-        if '"isRecording": false' in info:
-            break
+        try:
+            info = subprocess.run([cmd, "-i"], capture_output=True, text=True, timeout=10).stdout
+            if '"isRecording": false' in info:
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
         time.sleep(0.2)
     else:
-        subprocess.run([cmd, "-q"], capture_output=True)
+        try:
+            subprocess.run([cmd, "-q"], capture_output=True, timeout=5)
+        except Exception:
+            pass
     return f if f.exists() else None
 
 
@@ -468,10 +596,16 @@ def capture_termux(cfg: dict, seconds: int) -> np.ndarray:
 
 
 def run_termux(cfg: dict, args, emit):
+    # Resolve binary path once; if missing, fail early rather than silently in finally
+    _tmx_cmd = _tmx(cfg)
     subnoise = getattr(args, "subnoise", False)
     level = args.aggressiveness if args.aggressiveness is not None else (3 if args.robust else int(cfg["aggressiveness"]))
     blank_penalty = getattr(args, "blank_penalty", 0.6)
+    if not args.jsonl:
+        print("[stt] Loading offline model...", file=sys.stderr, flush=True)
     rec = asr.offline(cfg, args.model, args.threads, blank_penalty=blank_penalty)
+    if not args.jsonl:
+        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     q: queue.Queue = queue.Queue(maxsize=4)
     stop = threading.Event()
 
@@ -499,7 +633,7 @@ def run_termux(cfg: dict, args, emit):
                 q.put((samples, t0))
     finally:
         try:
-            subprocess.run([_tmx(cfg), "-q"], capture_output=True, timeout=5)
+            subprocess.run([_tmx_cmd, "-q"], capture_output=True, timeout=5)
         except Exception:
             pass
         q.put(None)
@@ -658,15 +792,29 @@ class SoundDeviceSource:
 def get_windows_source(cfg: dict):
     backend = cfg.get("windows_backend", "auto")
     if backend == "sounddevice":
+        # Verify sounddevice has input devices
+        try:
+            import sounddevice as sd
+            devs = sd.query_devices()
+            in_devs = [d for d in devs if d.get('max_input_channels', 0) > 0]
+            if not in_devs:
+                raise RuntimeError("No input devices found for sounddevice")
+        except Exception as e:
+            raise RuntimeError(f"sounddevice backend unavailable: {e}")
         return SoundDeviceSource(cfg)
     elif backend == "dshow":
         return WindowsDShowSource(cfg)
     else:
+        # Auto: try sounddevice first if it has input devices, else dshow
         try:
-            import sounddevice  # noqa: F401
-            return SoundDeviceSource(cfg)
-        except ImportError:
-            return WindowsDShowSource(cfg)
+            import sounddevice as sd
+            devs = sd.query_devices()
+            in_devs = [d for d in devs if d.get('max_input_channels', 0) > 0]
+            if in_devs:
+                return SoundDeviceSource(cfg)
+        except Exception:
+            pass
+        return WindowsDShowSource(cfg)
 
 
 # ---------------------------------------------------------------- detection
@@ -674,9 +822,9 @@ def get_windows_source(cfg: dict):
 def detect(cfg: dict) -> dict:
     """Return {backend: (ok, detail)} without recording."""
     res = {}
-    pa, parec = _which(cfg, "pulseaudio"), _which(cfg, "parec")
+    pa, parec = which(cfg, "pulseaudio"), which(cfg, "parec")
     res["pulse"] = (bool(pa and parec), f"pulseaudio={pa} parec={parec}")
-    cmd = _which(cfg, "termux-microphone-record")
+    cmd = which(cfg, "termux-microphone-record")
     ok, detail = False, "termux-microphone-record not found"
     if cmd:
         try:

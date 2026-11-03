@@ -8,6 +8,8 @@
 5  `--distant`: normalize-only (no denoiser) and level 3, keeps the more complete transcript. Measured best for
    speech at or below the room-noise level, where the denoiser only erases signal
 """
+import sys
+import time
 import numpy as np
 
 from . import asr, audio
@@ -120,7 +122,7 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
     return round(fitness, 2), "coherent"
 
 
-def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None = None, progress_cb=None) -> list[tuple[float, float, str]]:
+def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None = None, progress_cb=None, model: str | None = None, threads: int | None = None) -> list[tuple[float, float, str]]:
     """Aggressive multi-model denoising and formant scanning for speech near/below the noise floor.
 
     1. Removes high-energy sub-120 Hz acoustic rumble (common in room mics/phone recordings).
@@ -139,7 +141,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     step = int(tuned.get("step_sec", 2.0) * audio.SR)
     bp = tuned.get("blank_penalty")
     if bp is not None:
-        rec = asr.get_offline(cfg, blank_penalty=bp)
+        rec = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=bp)
 
     # 1. High-pass filter (>low_hz) + Formant boost (300-3200 Hz)
     fft = np.fft.rfft(samples)
@@ -155,14 +157,16 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     try:
         cfg_g = dict(cfg, robust_denoiser="gtcrn_simple.onnx")
         models.append(("gtcrn", audio.denoise(hp, cfg_g)))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[stt] Warning: GTCRN denoiser unavailable: {e}", file=sys.stderr)
     try:
         cfg_d4 = dict(cfg, robust_denoiser="dpdfnet4.onnx")
         models.append(("dp4", audio.denoise(hp, cfg_d4)))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[stt] Warning: DPDFNet4 denoiser unavailable: {e}", file=sys.stderr)
     models.append(("hp", hp))
+    if len(models) == 1:
+        print("[stt] Warning: No neural denoisers available; using high-pass only", file=sys.stderr)
 
     # 3. Sliding window formant scan
     if len(samples) <= win_len:
@@ -175,13 +179,23 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     norm = lambda c: c * (0.8 / max(float(np.abs(c).max()), 1e-6))
     raw_hits = []
     total_wins = len(windows)
+    
+    # Progress throttling
+    last_progress_time = 0.0
+    last_progress_pct = -5
 
     for idx, (start_idx, end_idx) in enumerate(windows):
         t0 = start_idx / audio.SR
         t1 = end_idx / audio.SR
 
+        # Throttle progress callback: every 5% or 1 second
         if progress_cb:
-            progress_cb(idx + 1, total_wins, t1, dur)
+            pct = int((idx + 1) / total_wins * 100) if total_wins > 0 else 100
+            now = time.time()
+            if pct - last_progress_pct >= 5 or now - last_progress_time >= 1.0:
+                progress_cb(idx + 1, total_wins, t1, dur)
+                last_progress_pct = pct
+                last_progress_time = now
 
         best_text = ""
         best_score = -1.0
@@ -209,18 +223,36 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
             deduped.append((s, e, text))
             continue
         prev_s, prev_e, prev_text = deduped[-1]
-        if text.lower() in prev_text.lower():
+        
+        # Word-level containment check (more robust than substring)
+        prev_words = prev_text.lower().split()
+        curr_words = text.lower().split()
+        
+        # Check if current is subset of previous (word sequence)
+        is_subset = False
+        for i in range(len(prev_words) - len(curr_words) + 1):
+            if prev_words[i:i+len(curr_words)] == curr_words:
+                is_subset = True
+                break
+        if is_subset:
             continue
-        if prev_text.lower() in text.lower():
+            
+        # Check if previous is subset of current
+        is_superset = False
+        for i in range(len(curr_words) - len(prev_words) + 1):
+            if curr_words[i:i+len(prev_words)] == prev_words:
+                is_superset = True
+                break
+        if is_superset:
             deduped[-1] = (prev_s, e, text)
             continue
+        
         if s < prev_e:
-            words_prev = prev_text.split()
-            words_curr = text.split()
+            # Overlapping windows - find word-level overlap
             merged = False
-            for k in range(min(len(words_prev), len(words_curr)), 0, -1):
-                if [w.lower() for w in words_prev[-k:]] == [w.lower() for w in words_curr[:k]]:
-                    combined = " ".join(words_prev + words_curr[k:])
+            for k in range(min(len(prev_words), len(curr_words)), 0, -1):
+                if prev_words[-k:] == curr_words[:k]:
+                    combined = " ".join(prev_text.split() + text.split()[k:])
                     deduped[-1] = (prev_s, e, combined)
                     merged = True
                     break
@@ -232,10 +264,10 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     return deduped
 
 
-def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode: str = 'lead', pre: bool = False, subnoise: bool = False, params: dict | None = None, progress_cb=None) -> list[tuple[float, float, str]]:
+def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode: str = 'lead', pre: bool = False, subnoise: bool = False, params: dict | None = None, progress_cb=None, model: str | None = None, threads: int | None = None) -> list[tuple[float, float, str]]:
     """Return [(start, end, text)] for the whole signal at the given aggressiveness."""
     if subnoise:
-        return subnoise_transcribe(rec, samples, cfg, params=params, progress_cb=progress_cb)
+        return subnoise_transcribe(rec, samples, cfg, params=params, progress_cb=progress_cb, model=model, threads=threads)
 
     if level <= 0:
         segs = list(audio.segments(samples, cfg))
@@ -269,6 +301,6 @@ def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode
 
     # Auto-fallback: if standard levels find no speech and level >= 5, try subnoise scan
     if not best and level >= 5:
-        return subnoise_transcribe(rec, samples, cfg, params=params, progress_cb=progress_cb)
+        return subnoise_transcribe(rec, samples, cfg, params=params, progress_cb=progress_cb, model=model, threads=threads)
 
     return best

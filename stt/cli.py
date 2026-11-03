@@ -72,8 +72,6 @@ def _common(p):
                    help="noisy-audio effort: 0 off, 1 loose VAD, 2 +denoise, 3 tuned (same as --robust), "
                         "4 +second variant, keep the more complete, 5 = --distant. Higher = slower. File and termux-mic only")
     p.add_argument("--robust", action="store_true", help="shortcut for --aggressiveness 3")
-    p.add_argument("--subnoise", action="store_true",
-                   help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
     p.add_argument("--auto", action="store_true",
                    help="dynamically determine window, step, and filtering based on duration and heavy noise floor")
     p.add_argument("-i", "--interactive", action="store_true",
@@ -218,9 +216,49 @@ def interactive_wizard(args, cfg, is_file=True):
     if thr_in.isdigit():
         args.threads = int(thr_in)
 
+    # Offer to save to config
+    print("\n[Save] Configuration:", file=sys.stderr)
+    print("  Save these settings to config file for future runs?", file=sys.stderr)
+    save_choice = input("  Save to config? [y/N]: ").strip().lower()
+    if save_choice in ('y', 'yes'):
+        save_wizard_config(args, cfg, is_file)
+
     print("\n" + "=" * 65, file=sys.stderr)
     print("  Configuration complete. Proceeding to execution...", file=sys.stderr)
     print("=" * 65 + "\n", file=sys.stderr)
+
+
+def save_wizard_config(args, cfg, is_file: bool):
+    """Save wizard choices to config file."""
+    from . import config
+    updates = {}
+    
+    if is_file:
+        if getattr(args, "auto", False):
+            updates["aggressiveness"] = 0  # auto uses level 0 with subnoise
+        elif getattr(args, "robust", False):
+            updates["aggressiveness"] = 3
+        elif getattr(args, "aggressiveness", None) is not None:
+            updates["aggressiveness"] = args.aggressiveness
+    else:
+        # Mic mode settings
+        if getattr(args, "subnoise", False):
+            updates["aggressiveness"] = 0  # subnoise uses its own logic
+        elif getattr(args, "whisper", False):
+            updates["aggressiveness"] = 3
+        elif getattr(args, "distant", False):
+            updates["aggressiveness"] = 5
+    
+    if getattr(args, "blank_penalty", None) is not None:
+        updates["blank_penalty"] = args.blank_penalty
+    if getattr(args, "threads", None) is not None:
+        updates["threads"] = args.threads
+    
+    if updates:
+        config.update_config(updates)
+        print(f"[stt] Saved {len(updates)} setting(s) to {config.CONFIG_PATH}", file=sys.stderr)
+    else:
+        print("[stt] No settings to save", file=sys.stderr)
 
 
 def cmd_file(args, cfg):
@@ -234,9 +272,16 @@ def cmd_file(args, cfg):
     if not resolved_paths:
         sys.exit("[stt] error: no supported audio/video files found in given paths")
 
-    is_auto = getattr(args, "auto", False) or (args.aggressiveness is None and not args.robust and not args.subnoise)
+    is_auto = getattr(args, "auto", False)
     level = _level(args, cfg)
-    rec = asr.offline(cfg, args.model, args.threads)
+    bp = getattr(args, "blank_penalty", None)
+    if bp is None:
+        bp = cfg.get("blank_penalty")
+    if not args.jsonl:
+        print("[stt] Loading model...", file=sys.stderr, flush=True)
+    rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
+    if not args.jsonl:
+        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     out = open(args.out, "w") if args.out else sys.stdout
     total_audio = total_proc = 0.0
     total_files = len(resolved_paths)
@@ -276,7 +321,8 @@ def cmd_file(args, cfg):
                 progress_cb = make_progress_bar()
                 triples = robust.transcribe(
                     rec, samples, cfg, level=0, subnoise=True,
-                    params=auto_params, progress_cb=progress_cb
+                    params=auto_params, progress_cb=progress_cb,
+                    model=args.model, threads=args.threads
                 )
                 sys.stderr.write("\r\033[K")
                 sys.stderr.flush()
@@ -336,10 +382,58 @@ def cmd_mic(args, cfg):
     from . import mic
 
     _lang_note(args)
+    
+    # Handle --list-devices
+    if getattr(args, "list_devices", False):
+        print("[stt] Available audio input devices:")
+        print()
+        
+        # Pulse/Termux (Linux/Android)
+        if sys.platform != "win32":
+            print("Linux/Android (PulseAudio/Termux):")
+            pa = mic.which(cfg, "pulseaudio")
+            parec = mic.which(cfg, "parec")
+            if pa and parec:
+                print(f"  PulseAudio: {pa}")
+                print(f"  parec: {parec}")
+            termux_rec = mic.which(cfg, "termux-microphone-record")
+            if termux_rec:
+                print(f"  Termux:API: {termux_rec}")
+            print()
+        
+        # Windows
+        if sys.platform == "win32" or True:  # Also show on other platforms for cross-compile
+            print("Windows:")
+            # DirectShow
+            dshow_devs = mic.list_dshow_audio_devices()
+            if dshow_devs:
+                print("  DirectShow (ffmpeg):")
+                for i, dev in enumerate(dshow_devs):
+                    print(f"    [{i}] {dev}")
+            else:
+                print("  DirectShow: no devices found")
+            
+            # sounddevice
+            try:
+                import sounddevice as sd
+                devs = sd.query_devices()
+                in_devs = [(i, d) for i, d in enumerate(devs) if d.get('max_input_channels', 0) > 0]
+                if in_devs:
+                    print("  sounddevice (PortAudio/WASAPI):")
+                    for i, dev in in_devs:
+                        print(f"    [{i}] {dev.get('name')} (channels: {dev.get('max_input_channels')})")
+                else:
+                    print("  sounddevice: no input devices found")
+            except ImportError:
+                print("  sounddevice: not installed")
+            except Exception as e:
+                print(f"  sounddevice: error - {e}")
+        return
+    
     if getattr(args, "interactive", False):
         interactive_wizard(args, cfg, is_file=False)
-    if _level(args, cfg):
-        print("[stt] aggressiveness applies to the termux backend; the streaming pulse backend ignores it", file=sys.stderr)
+    if _level(args, cfg) and not args.whisper and not args.distant and not getattr(args, "subnoise", False):
+        print("[stt] note: -a/--aggressiveness applies to the termux backend and --whisper/--distant; the streaming pulse backend ignores it", file=sys.stderr)
     backend = args.backend or cfg["mic_backend"]
     avail = mic.detect(cfg)
     if backend == "auto":
@@ -382,6 +476,47 @@ def cmd_mic(args, cfg):
             print(f"[stt] backend {b} failed: {e}", file=sys.stderr)
             if i == len(order) - 1:
                 sys.exit(1)
+
+
+def cmd_config(args, cfg):
+    action = args.config_action
+    if action == "show":
+        print(f"Config file: {config.CONFIG_PATH}")
+        if config.CONFIG_PATH.exists():
+            print()
+            print(config.CONFIG_PATH.read_text())
+        else:
+            print("(not yet created; defaults shown below)")
+            for k, v in sorted(config.DEFAULTS.items()):
+                print(f"  {k} = {v!r}")
+    elif action == "reset":
+        if config.CONFIG_PATH.exists():
+            config.CONFIG_PATH.unlink()
+            print(f"[stt] Deleted {config.CONFIG_PATH}; defaults will be written on next run.")
+        else:
+            print(f"[stt] Config file not found: {config.CONFIG_PATH}")
+    elif action == "set":
+        if len(args.kv) < 2:
+            sys.exit("usage: stt config set KEY VALUE")
+        key = args.kv[0]
+        raw = " ".join(args.kv[1:])
+        if key not in config.DEFAULTS:
+            known = ", ".join(sorted(config.DEFAULTS))
+            sys.exit(f"[stt] unknown config key '{key}'. Known keys:\n  {known}")
+        default_val = config.DEFAULTS[key]
+        try:
+            if isinstance(default_val, bool):
+                value = raw.lower() in ("true", "1", "yes")
+            elif isinstance(default_val, int):
+                value = int(raw)
+            elif isinstance(default_val, float):
+                value = float(raw)
+            else:
+                value = raw
+        except ValueError:
+            sys.exit(f"[stt] invalid value for '{key}': {raw!r} (expected {type(default_val).__name__})")
+        config.update_config({key: value})
+        print(f"[stt] {key} = {value!r}  →  {config.CONFIG_PATH}")
 
 
 def cmd_ui(args, cfg):
@@ -449,6 +584,8 @@ def main(argv=None):
     f.add_argument("--sidecar", action="store_true", help="save sidecar subtitle/transcript file next to each input file (e.g. video.mp4 -> video.srt)")
     f.add_argument("--out", help="write output to this file")
     f.add_argument("-v", "--verbose", action="store_true", help="print timing / real-time factor to stderr")
+    f.add_argument("--subnoise", action="store_true",
+                   help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
     _common(f)
     f.set_defaults(fn=cmd_file)
 
@@ -456,12 +593,16 @@ def main(argv=None):
     m.add_argument("--partial", action="store_true", help="show interim text (pulse backend)")
     m.add_argument("--backend", choices=["pulse", "termux", "windows"], help="override auto-detection")
     m.add_argument("--jsonl", action="store_true")
-    m.add_argument("--whisper", action="store_true",
+    mic_mode = m.add_mutually_exclusive_group()
+    mic_mode.add_argument("--whisper", action="store_true",
                    help="whispering / noisy room: cut utterances with the VAD, denoise + normalize each, decode with the "
                         "offline model (text appears when you pause; implies -a 3 unless -a is given)")
-    m.add_argument("--distant", action="store_true",
+    mic_mode.add_argument("--distant", action="store_true",
                    help="very quiet / far-away speech: like --whisper but with the most sensitive VAD, larger gain "
                         "and a normalize-or-denoise decode (level 5)")
+    mic_mode.add_argument("--subnoise", action="store_true",
+                   help="continuous sliding ring-buffer scan with multi-model denoising for sub-noise speech")
+    m.add_argument("--list-devices", action="store_true", help="list available audio input devices and exit")
     m.add_argument("--no-calibrate", action="store_true", help="skip the 2 s room-noise calibration at start")
     m.add_argument("--save", metavar="WAV", help="also write the raw captured audio (pulse backend) for tuning")
     m.add_argument("--debug", action="store_true", help="print mic level / AGC gain / VAD state once a second (pulse backend)")
@@ -476,6 +617,14 @@ def main(argv=None):
 
     d = sub.add_parser("doctor", help="check dependencies, models, mic backends")
     d.set_defaults(fn=cmd_doctor)
+
+    cfg_p = sub.add_parser("config", help="view or edit configuration")
+    cfg_sub = cfg_p.add_subparsers(dest="config_action", required=True)
+    cfg_sub.add_parser("show", help="print config file path and current values")
+    cfg_sub.add_parser("reset", help="delete config file (defaults restored on next run)")
+    cfg_set = cfg_sub.add_parser("set", help="set a config key  (e.g. stt config set threads 2)")
+    cfg_set.add_argument("kv", nargs="+", metavar="KEY VALUE")
+    cfg_p.set_defaults(fn=cmd_config)
 
     args = ap.parse_args(argv)
     names = getattr(args, "model", None) or []

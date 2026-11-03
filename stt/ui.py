@@ -7,8 +7,6 @@ Features:
 - Complete keyboard hotkeys for hands-free navigation.
 - Zero external dependencies (pure Python standard library http.server).
 """
-import email
-import email.policy
 import http.server
 import json
 import os
@@ -23,6 +21,54 @@ import webbrowser
 from pathlib import Path
 
 from . import __version__, asr, audio, config, robust
+
+
+def _parse_multipart(content_type: str, raw_body: bytes) -> list[dict]:
+    """Parse multipart/form-data body into [{name, filename, data}].
+
+    Uses raw boundary splitting so binary audio payloads are never decoded as text.
+    """
+    boundary = None
+    for param in content_type.split(";"):
+        param = param.strip()
+        if param.lower().startswith("boundary="):
+            boundary = param[9:].strip('"\'')
+            break
+    if not boundary:
+        return []
+
+    sep = ("--" + boundary).encode("latin-1")
+    parts = []
+    for raw_part in raw_body.split(sep):
+        stripped = raw_part.strip(b"\r\n")
+        if not stripped or stripped == b"--":
+            continue
+        if b"\r\n\r\n" in stripped:
+            headers_raw, body = stripped.split(b"\r\n\r\n", 1)
+        elif b"\n\n" in stripped:
+            headers_raw, body = stripped.split(b"\n\n", 1)
+        else:
+            continue
+        if body.endswith(b"\r\n"):
+            body = body[:-2]
+        name = filename = None
+        for hline in headers_raw.decode("latin-1", errors="replace").splitlines():
+            if ":" not in hline:
+                continue
+            hname, hval = hline.split(":", 1)
+            if hname.strip().lower() == "content-disposition":
+                for p in hval.split(";"):
+                    p = p.strip()
+                    if p.lower().startswith("name="):
+                        name = p[5:].strip("\"'")
+                    elif p.lower().startswith("filename="):
+                        filename = p[9:].strip("\"'")
+        if name:
+            parts.append({"name": name, "filename": filename, "data": body})
+    return parts
+
+# Thread-safe abort flag shared across concurrent request threads
+_transcription_abort = threading.Event()
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -169,6 +215,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 10px;
     font-size: 0.9rem;
     cursor: pointer;
+  }
+
+  /* Window overlap canvas */
+  .win-canvas-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #windowCanvas {
+    width: 100%;
+    border-radius: 6px;
+    display: block;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+  }
+  .win-canvas-info {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: monospace;
+    text-align: center;
+  }
+
+  /* Transcription error message */
+  .error-banner {
+    background: rgba(239,68,68,0.12);
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 0.88rem;
+    color: var(--danger);
+    display: none;
   }
 
   /* Main Workspace */
@@ -487,7 +564,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="logo">
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent);"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
     talk-to-typed
-    <span class="badge">v0.2.0</span>
+    <span class="badge">v%STT_VERSION%</span>
   </div>
   <div class="header-actions">
     <button class="btn btn-outline btn-sm" id="btnHotkeys" title="Keyboard Shortcuts (?)">
@@ -555,6 +632,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <span>Recursive directory search (-r)</span>
       </label>
     </div>
+
+    <div class="section-title">Buffer Overlap Preview</div>
+    <div class="win-canvas-wrap">
+      <canvas id="windowCanvas" width="310" height="90"></canvas>
+      <div class="win-canvas-info" id="winInfo">window: 5.0s | step: 1.5s | overlap: 70%</div>
+    </div>
   </aside>
 
   <!-- Main Work Area -->
@@ -588,6 +671,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="btn btn-outline btn-sm" id="btnRunPath">Load Path</button>
       </div>
     </div>
+
+    <!-- Error Banner -->
+    <div class="error-banner" id="errorBanner"></div>
 
     <!-- Deterministic Reasoning Display -->
     <div class="reasoning-box" id="reasoningBox">
@@ -639,6 +725,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </button>
           <button class="btn btn-outline btn-sm btn-danger" id="btnClear" title="Clear Text (Alt+X)">
             Clear
+          </button>
+          <button class="btn btn-outline btn-sm btn-danger" id="btnCancel" title="Cancel Transcription (Alt+Z)">
+            Cancel
           </button>
         </div>
       </div>
@@ -707,6 +796,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const procStats = document.getElementById('procStats');
   const reasoningBox = document.getElementById('reasoningBox');
   const reasoningList = document.getElementById('reasoningList');
+  const errorBanner = document.getElementById('errorBanner');
   const progressWrap = document.getElementById('progressWrap');
   const progFill = document.getElementById('progFill');
   const progPct = document.getElementById('progPct');
@@ -771,6 +861,112 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const valBlank = document.getElementById('valBlank');
   blankPenalty.addEventListener('input', () => valBlank.textContent = parseFloat(blankPenalty.value).toFixed(1));
 
+  // ── Window Overlap Visualization ──────────────────────────────────────────
+  function drawWindowViz() {
+    const canvas = document.getElementById('windowCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const winSec  = parseFloat(document.getElementById('windowSize').value) || 5.0;
+    const stepSec = parseFloat(document.getElementById('stepSize').value)   || 1.5;
+    const overlapSec = Math.max(0, winSec - stepSec);
+    const overlapPct = winSec > 0 ? Math.round(overlapSec / winSec * 100) : 0;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Background
+    ctx.fillStyle = '#090b10';
+    ctx.fillRect(0, 0, W, H);
+
+    // Layout constants
+    const PAD = 4, TOPPAD = 12, WBOX_H = 32, WIN_STACK = 6;
+    // Show ~3 full windows: total display duration
+    const showDur = stepSec * 2 + winSec;
+    const pps = (W - 2 * PAD) / showDur;  // pixels per second
+    const winPx = winSec * pps;
+
+    const colors = [
+      'rgba(59,130,246,0.50)',
+      'rgba(99,160,250,0.42)',
+      'rgba(59,130,246,0.35)',
+    ];
+
+    // Draw each window box (up to 3)
+    const nWins = Math.min(3, Math.ceil(showDur / stepSec));
+    for (let i = 0; i < nWins; i++) {
+      const x = PAD + i * stepSec * pps;
+      const y = TOPPAD + i * WIN_STACK;
+      ctx.fillStyle = colors[i % colors.length];
+      ctx.fillRect(x, y, winPx, WBOX_H);
+      ctx.strokeStyle = 'rgba(96,165,250,0.75)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, y + 0.5, winPx - 1, WBOX_H - 1);
+    }
+
+    // Overlap highlight (between window 0 and window 1)
+    if (nWins >= 2 && overlapSec > 0) {
+      const overlapStart = PAD + stepSec * pps;
+      const overlapW = overlapSec * pps;
+      ctx.fillStyle = 'rgba(245,158,11,0.18)';
+      ctx.fillRect(overlapStart, TOPPAD, overlapW, WBOX_H);
+      ctx.strokeStyle = 'rgba(245,158,11,0.5)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
+      ctx.strokeRect(overlapStart + 0.5, TOPPAD + 0.5, overlapW - 1, WBOX_H - 1);
+      ctx.setLineDash([]);
+    }
+
+    // Step-size brace (bottom)
+    const arrowY = TOPPAD + WBOX_H + WIN_STACK * (nWins - 1) + 10;
+    if (nWins >= 2) {
+      const x0 = PAD, x1 = PAD + stepSec * pps;
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 2]);
+      ctx.beginPath(); ctx.moveTo(x0, arrowY); ctx.lineTo(x1, arrowY); ctx.stroke();
+      ctx.setLineDash([]);
+      // arrowheads
+      ctx.fillStyle = '#f59e0b';
+      const ah = 3;
+      ctx.beginPath(); ctx.moveTo(x0,    arrowY); ctx.lineTo(x0 + ah, arrowY - ah); ctx.lineTo(x0 + ah, arrowY + ah); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x1,    arrowY); ctx.lineTo(x1 - ah, arrowY - ah); ctx.lineTo(x1 - ah, arrowY + ah); ctx.closePath(); ctx.fill();
+      // step label
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('step', (x0 + x1) / 2, arrowY - 4);
+      ctx.textAlign = 'left';
+    }
+
+    // Window-size brace (top)
+    const bracY = TOPPAD - 3;
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(PAD, bracY); ctx.lineTo(PAD + winPx, bracY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    const winLabel = `win`;
+    ctx.fillText(winLabel, PAD + winPx / 2, bracY - 2);
+    ctx.textAlign = 'left';
+
+    // Timeline bar
+    ctx.fillStyle = '#28303f';
+    ctx.fillRect(PAD, H - 10, W - 2 * PAD, 4);
+    ctx.fillStyle = '#3b82f6';
+    ctx.fillRect(PAD, H - 10, Math.min(winPx * nWins * 0.7, W - 2 * PAD), 4);
+
+    // Update text info
+    document.getElementById('winInfo').textContent =
+      `window ${winSec.toFixed(1)}s  |  step ${stepSec.toFixed(1)}s  |  overlap ${overlapPct}%`;
+  }
+
+  document.getElementById('windowSize').addEventListener('input', drawWindowViz);
+  document.getElementById('stepSize').addEventListener('input', drawWindowViz);
+  drawWindowViz();  // initial draw
+
   // File pickers
   document.getElementById('btnBrowseFile').onclick = () => fileInput.click();
   document.getElementById('btnBrowseFolder').onclick = () => folderInput.click();
@@ -832,11 +1028,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     };
 
     reasoningBox.style.display = 'none';
+    errorBanner.style.display = 'none';
     progressWrap.style.display = 'block';
+    progFill.style.width = '0%';
+    progPct.textContent = '0%';
+    progFile.textContent = 'Starting…';
+    progTime.textContent = '00:00 / 00:00';
+    progSpeed.textContent = '';
     segmentsHistory = [];
     output.value = "";
     segmentsList.innerHTML = "";
     updateStats();
+
+    function onFetchError(err) {
+      progressWrap.style.display = 'none';
+      errorBanner.textContent = 'Network error: ' + (err.message || err);
+      errorBanner.style.display = 'block';
+      procStats.textContent = 'Failed';
+    }
 
     if (selectedFiles.length && !pathVal) {
       // Upload via FormData
@@ -844,17 +1053,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
       for (const f of selectedFiles) formData.append('files', f);
       formData.append('config', JSON.stringify(payload));
 
-      procStats.textContent = "Uploading & processing...";
+      procStats.textContent = "Uploading & processing…";
       fetch('/api/transcribe_upload', { method: 'POST', body: formData })
-        .then(res => handleSSE(res));
+        .then(res => {
+          if (!res.ok) {
+            res.text().then(t => {
+              errorBanner.textContent = 'Server error ' + res.status + ': ' + t.substring(0, 200);
+              errorBanner.style.display = 'block';
+              progressWrap.style.display = 'none';
+              procStats.textContent = 'Error';
+            });
+            return;
+          }
+          handleSSE(res);
+        })
+        .catch(onFetchError);
     } else {
       // Run on local path
-      procStats.textContent = "Scanning & processing local path...";
+      procStats.textContent = "Scanning & processing local path…";
       fetch('/api/transcribe_path', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
-      }).then(res => handleSSE(res));
+      })
+        .then(res => {
+          if (!res.ok) {
+            res.text().then(t => {
+              errorBanner.textContent = 'Server error ' + res.status + ': ' + t.substring(0, 200);
+              errorBanner.style.display = 'block';
+              progressWrap.style.display = 'none';
+              procStats.textContent = 'Error';
+            });
+            return;
+          }
+          handleSSE(res);
+        })
+        .catch(onFetchError);
     }
   }
 
@@ -866,7 +1100,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function read() {
       reader.read().then(({ done, value }) => {
         if (done) {
-          procStats.textContent = "Finished!";
+          // Only update if not already set by "done" event
+          if (!procStats.textContent.startsWith('Completed') && !procStats.textContent.startsWith('Error') && !procStats.textContent.startsWith('Cancelled')) {
+            procStats.textContent = "Finished!";
+          }
+          progressWrap.style.display = 'none';
           return;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -888,7 +1126,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               reasoningList.innerHTML = "";
               for (const r of data.reasons) {
                 const li = document.createElement('li');
-                li.innerHTML = `• ${r}`;
+                li.textContent = `• ${r}`;
                 reasoningList.appendChild(li);
               }
               reasoningBox.style.display = 'block';
@@ -920,13 +1158,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
               updateStats();
             } else if (eventType === "done") {
+              progressWrap.style.display = 'none';
               procStats.textContent = `Completed in ${data.elapsed.toFixed(1)}s (RTF: ${data.rtf.toFixed(2)}x)`;
+            } else if (eventType === "error") {
+              progressWrap.style.display = 'none';
+              errorBanner.textContent = 'Transcription error: ' + data.message;
+              errorBanner.style.display = 'block';
+              procStats.textContent = 'Error';
+            } else if (eventType === "aborted") {
+              progressWrap.style.display = 'none';
+              procStats.textContent = 'Cancelled';
             }
           } catch (e) {
             console.error("SSE parse error", e, dataStr);
           }
         }
         read();
+      }).catch(err => {
+        progressWrap.style.display = 'none';
+        procStats.textContent = 'Stream error';
+        console.error('SSE read error:', err);
       });
     }
     read();
@@ -954,6 +1205,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     segmentsList.innerHTML = "";
     segmentsHistory = [];
     updateStats();
+  };
+
+  // Cancel Transcription
+  document.getElementById('btnCancel').onclick = () => {
+    fetch('/api/abort', { method: 'POST' })
+      .then(() => {
+        procStats.textContent = "Cancelled";
+        const btn = document.getElementById('btnCancel');
+        btn.textContent = "Cancelled";
+        setTimeout(() => btn.textContent = "Cancel", 2000);
+      })
+      .catch(() => {});
   };
 
   // Export TXT
@@ -1052,41 +1315,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     } else if (e.altKey && (e.key === 'x' || e.key === 'X')) {
       e.preventDefault();
       document.getElementById('btnClear').click();
-    } else if (e.altKey && (e.key === 'a' || e.key === 'A')) {
+    } else if (e.altKey && (e.key === 'z' || e.key === 'Z')) {
       e.preventDefault();
-      document.getElementById('strategy').value = 'auto';
-    } else if (e.altKey && (e.key === 'n' || e.key === 'N')) {
-      e.preventDefault();
-      document.getElementById('strategy').value = 'subnoise';
-    }
-  });
-</script>
-
-    if (e.key === '?' || e.key === 'F1') {
-      if (document.activeElement !== output) {
-        e.preventDefault();
-        modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
-      }
-    } else if (e.key === 'Escape') {
-      modal.style.display = 'none';
-    } else if (ctrl && (e.key === 'o' || e.key === 'O')) {
-      e.preventDefault();
-      fileInput.click();
-    } else if (ctrl && (e.key === 'd' || e.key === 'D')) {
-      e.preventDefault();
-      folderInput.click();
-    } else if (ctrl && e.key === 'Enter') {
-      e.preventDefault();
-      startTranscription();
-    } else if (ctrl && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault();
-      document.getElementById('btnExportTxt').click();
-    } else if (e.altKey && (e.key === 'c' || e.key === 'C')) {
-      e.preventDefault();
-      document.getElementById('btnCopy').click();
-    } else if (e.altKey && (e.key === 'x' || e.key === 'X')) {
-      e.preventDefault();
-      document.getElementById('btnClear').click();
+      document.getElementById('btnCancel').click();
     } else if (e.altKey && (e.key === 'a' || e.key === 'A')) {
       e.preventDefault();
       document.getElementById('strategy').value = 'auto';
@@ -1111,7 +1342,7 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/" or parsed.path == "/index.html":
-            content = HTML_PAGE.encode("utf-8")
+            content = HTML_PAGE.replace("%STT_VERSION%", __version__).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
@@ -1137,7 +1368,36 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             if not target_path or not Path(target_path).is_file():
                 self.send_error(404, "Audio file not found")
                 return
-            p = Path(target_path)
+            p = Path(target_path).resolve()
+            
+            # Security: restrict to allowed directories
+            allowed_roots = [
+                Path.home().resolve(),
+                Path.cwd().resolve(),
+                Path(tempfile.gettempdir()).resolve(),
+            ]
+            # Add configured models/data directories if they exist
+            try:
+                from . import config as stt_config
+                allowed_roots.append(Path(stt_config.DATA_DIR).resolve())
+                allowed_roots.append(Path(stt_config.CONFIG_PATH).parent.resolve())
+            except Exception:
+                pass
+            
+            # Check if path is under any allowed root
+            allowed = False
+            for root in allowed_roots:
+                try:
+                    p.relative_to(root)
+                    allowed = True
+                    break
+                except ValueError:
+                    continue
+            
+            if not allowed:
+                self.send_error(403, "Path not in allowed directories")
+                return
+
             content_type = "audio/wav"
             suf = p.suffix.lower()
             if suf in (".mp3",):
@@ -1153,15 +1413,54 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
 
             try:
                 size = p.stat().st_size
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(size))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                with open(p, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
-            except Exception:
-                pass
+                range_header = self.headers.get("Range")
+                
+                if range_header:
+                    # Parse Range header: "bytes=start-end"
+                    range_match = range_header.strip().lower()
+                    if not range_match.startswith("bytes="):
+                        self.send_error(416, "Invalid Range header")
+                        return
+                    range_spec = range_match[6:]
+                    parts = range_spec.split("-")
+                    start = int(parts[0]) if parts[0] else 0
+                    end = int(parts[1]) if len(parts) > 1 and parts[1] else size - 1
+                    
+                    if start >= size or end >= size or start > end:
+                        self.send_error(416, "Range Not Satisfiable")
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    
+                    content_length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(content_length))
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    
+                    with open(p, "rb") as f:
+                        f.seek(start)
+                        remaining = content_length
+                        chunk_size = 8192
+                        while remaining > 0:
+                            read_size = min(chunk_size, remaining)
+                            data = f.read(read_size)
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            remaining -= len(data)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    with open(p, "rb") as f:
+                        shutil.copyfileobj(f, self.wfile)
+            except Exception as e:
+                self.send_error(500, f"Internal server error: {e}")
         else:
             self.send_error(404, "Not Found")
 
@@ -1171,8 +1470,17 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             self.handle_transcribe_path()
         elif parsed.path == "/api/transcribe_upload":
             self.handle_transcribe_upload()
+        elif parsed.path == "/api/abort":
+            self.handle_abort()
         else:
             self.send_error(404, "Not Found")
+
+    def handle_abort(self):
+        _transcription_abort.set()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status": "aborted"}')
 
     def handle_transcribe_path(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1181,7 +1489,31 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
         server_path = req.get("server_path")
 
         if not server_path or not os.path.exists(server_path):
-            self.send_error(400, f"Path not found: {server_path}")
+            self.send_error(400, "Path not found")
+            return
+
+        # Security: restrict to the same allowed roots as /api/audio
+        p = Path(server_path).resolve()
+        allowed_roots = [
+            Path.home().resolve(),
+            Path.cwd().resolve(),
+            Path(tempfile.gettempdir()).resolve(),
+        ]
+        try:
+            allowed_roots.append(Path(config.DATA_DIR).resolve())
+            allowed_roots.append(Path(config.CONFIG_PATH).parent.resolve())
+        except Exception:
+            pass
+        allowed = False
+        for root in allowed_roots:
+            try:
+                p.relative_to(root)
+                allowed = True
+                break
+            except ValueError:
+                continue
+        if not allowed:
+            self.send_error(403, "Path not in allowed directories")
             return
 
         from .cli import collect_media_paths
@@ -1197,31 +1529,34 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "")
         raw_body = self.rfile.read(content_length)
 
-        full_msg = f"Content-Type: {content_type}\r\n\r\n".encode("utf-8") + raw_body
-        msg = email.message_from_bytes(full_msg, policy=email.policy.default)
+        parts = _parse_multipart(content_type, raw_body)
+        if not parts:
+            self.send_error(400, "Could not parse multipart upload (missing boundary?).")
+            return
 
         req = {}
         temp_files = []
         try:
-            if msg.is_multipart():
-                for part in msg.iter_parts():
-                    name = part.get_param("name", header="content-disposition")
-                    filename = part.get_filename()
-                    if name == "config":
-                        req = json.loads(part.get_payload())
-                    elif filename:
-                        suffix = Path(filename).suffix or ".wav"
-                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                        payload_data = part.get_payload(decode=True)
-                        tmp.write(payload_data)
+            for part in parts:
+                if part["name"] == "config":
+                    req = json.loads(part["data"].decode("utf-8", errors="replace"))
+                elif part.get("filename"):
+                    suffix = Path(part["filename"]).suffix or ".wav"
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    try:
+                        tmp.write(part["data"])
+                    finally:
                         tmp.close()
-                        temp_files.append((tmp.name, filename))
+                    temp_files.append((tmp.name, part["filename"]))
 
             if not temp_files:
-                self.send_error(400, "No audio files uploaded.")
+                self.send_error(400, "No audio files found in upload.")
                 return
 
-            self.stream_transcription_sse([t[0] for t in temp_files], req, display_names={t[0]: t[1] for t in temp_files})
+            self.stream_transcription_sse(
+                [t[0] for t in temp_files], req,
+                display_names={t[0]: t[1] for t in temp_files},
+            )
         finally:
             for tmp_path, _ in temp_files:
                 try:
@@ -1230,6 +1565,8 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     pass
 
     def stream_transcription_sse(self, paths, req, display_names=None):
+        _transcription_abort.clear()
+        
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1244,9 +1581,14 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-        cfg = self.server.cfg
-        threads = req.get("threads") or cfg.get("threads", 4)
-        rec = asr.offline(cfg, None, threads)
+        try:
+            cfg = self.server.cfg
+            threads = req.get("threads") or cfg.get("threads", 4)
+            blank_penalty = req.get("blank_penalty") or cfg.get("blank_penalty")
+            rec = asr.get_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
+        except Exception as e:
+            send_sse("error", {"message": f"Failed to load ASR model: {e}"})
+            return
 
         strategy = req.get("strategy", "auto")
         is_auto = strategy == "auto"
@@ -1256,6 +1598,11 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
         total_audio_sec = 0.0
 
         for path in paths:
+            # Check for abort
+            if _transcription_abort.is_set():
+                send_sse("aborted", {"message": "Transcription cancelled by user"})
+                return
+            
             disp_name = display_names.get(path, Path(path).name) if display_names else Path(path).name
             try:
                 samples = audio.decode(path)
@@ -1266,49 +1613,53 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             dur = len(samples) / audio.SR
             total_audio_sec += dur
 
-            if is_subnoise:
-                params = robust.auto_tune_settings(dur)
-                if req.get("rumble_cutoff") is not None:
-                    params["low_hz"] = float(req["rumble_cutoff"])
-                if req.get("formant_boost") is not None:
-                    params["boost_db"] = float(req["formant_boost"])
-                if req.get("blank_penalty") is not None:
-                    params["blank_penalty"] = float(req["blank_penalty"])
-                if req.get("window_size") is not None:
-                    params["win_sec"] = float(req["window_size"])
-                if req.get("step_size") is not None:
-                    params["step_sec"] = float(req["step_size"])
+            try:
+                if is_subnoise:
+                    params = robust.auto_tune_settings(dur)
+                    if req.get("rumble_cutoff") is not None:
+                        params["low_hz"] = float(req["rumble_cutoff"])
+                    if req.get("formant_boost") is not None:
+                        params["boost_db"] = float(req["formant_boost"])
+                    if req.get("blank_penalty") is not None:
+                        params["blank_penalty"] = float(req["blank_penalty"])
+                    if req.get("window_size") is not None:
+                        params["win_sec"] = float(req["window_size"])
+                    if req.get("step_size") is not None:
+                        params["step_sec"] = float(req["step_size"])
 
-                send_sse("reasoning", {"file": disp_name, "duration": dur, "reasons": params["reasoning"]})
+                    send_sse("reasoning", {"file": disp_name, "duration": dur, "reasons": params["reasoning"]})
 
-                t_start_file = time.time()
-                def progress_cb(current_step, total_steps, current_sec, total_sec):
-                    now = time.time()
-                    elapsed = now - t_start_file
-                    pct = int((current_step / total_steps) * 100) if total_steps > 0 else 0
-                    rtf = elapsed / max(current_sec, 0.001)
-                    rem_sec = max(0.0, total_sec - current_sec)
-                    eta_sec = rem_sec * rtf
-                    cur_m, cur_s = divmod(int(current_sec), 60)
-                    tot_m, tot_s = divmod(int(total_sec), 60)
-                    eta_m, eta_s = divmod(int(eta_sec), 60)
+                    t_start_file = time.time()
+                    def progress_cb(current_step, total_steps, current_sec, total_sec,
+                                    _t=t_start_file, _disp=disp_name):
+                        elapsed = time.time() - _t
+                        pct = int((current_step / total_steps) * 100) if total_steps > 0 else 0
+                        rtf = elapsed / max(current_sec, 0.001)
+                        eta_sec = max(0.0, total_sec - current_sec) * rtf
+                        cur_m, cur_s = divmod(int(current_sec), 60)
+                        tot_m, tot_s = divmod(int(total_sec), 60)
+                        eta_m, eta_s = divmod(int(eta_sec), 60)
+                        send_sse("progress", {
+                            "file": _disp,
+                            "pct": pct,
+                            "cur_time": f"{cur_m:02d}:{cur_s:02d}",
+                            "tot_time": f"{tot_m:02d}:{tot_s:02d}",
+                            "rtf": round(rtf, 2),
+                            "eta": f"{eta_m:02d}:{eta_s:02d}",
+                        })
 
-                    send_sse("progress", {
-                        "file": disp_name,
-                        "pct": pct,
-                        "cur_time": f"{cur_m:02d}:{cur_s:02d}",
-                        "tot_time": f"{tot_m:02d}:{tot_s:02d}",
-                        "rtf": round(rtf, 2),
-                        "eta": f"{eta_m:02d}:{eta_s:02d}"
-                    })
-
-                triples = robust.transcribe(
-                    rec, samples, cfg, level=0, subnoise=True,
-                    params=params, progress_cb=progress_cb
-                )
-            else:
-                level = 3 if strategy == "robust" else (5 if strategy == "distant" else 0)
-                triples = robust.transcribe(rec, samples, cfg, level=level, subnoise=False)
+                    triples = robust.transcribe(
+                        rec, samples, cfg, level=0, subnoise=True,
+                        params=params, progress_cb=progress_cb,
+                        model=None, threads=threads,
+                    )
+                else:
+                    level = 3 if strategy == "robust" else (5 if strategy == "distant" else 0)
+                    triples = robust.transcribe(rec, samples, cfg, level=level, subnoise=False)
+            except Exception as e:
+                send_sse("segment", {"file": disp_name, "start": 0, "end": 0,
+                                     "text": f"[Error transcribing {disp_name}: {e}]"})
+                continue
 
             for s, e, text in triples:
                 send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": text})
