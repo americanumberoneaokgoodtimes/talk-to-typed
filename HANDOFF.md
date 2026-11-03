@@ -12,14 +12,16 @@ A command `stt` that transcribes speech fully offline with sherpa-onnx (int8 mod
 - `-a 0-5` / `--robust` (= 3) "aggressiveness" for noisy audio.
 
 ## 2. Environment — read before touching anything
+<windows_notes>
+- We have recently decided to add Windows support. Notes for Windows environment shall be documented here.
+</windows_notes>
+<linux_notes>
 - **The shell is Kali Linux (uid 100000 `kali`, HOME=`/home/kali`), NOT native Termux.** `$PREFIX` is unset, there is no `pkg`.
   The user chose to install into the Kali userland. The original spec said `$PREFIX/bin`; the wrapper is at
   `~/.local/bin/stt` instead (on PATH).
 - **`~` is `/home/kali`; the Termux home is a *different* directory** `/data/data/com.termux/files/home`
   (this is also the session's working dir, holding `BUILD_LOG.md`, test audio, `captures/`, `noisy/`).
   Termux binaries live in `/data/data/com.termux/files/usr/bin` and run fine from Kali.
-- **No root in the agent shell.** `apt-get install` fails with "requires superuser" here; the user installed the apt packages
-  themselves via a `!` command in their own session. Do not use sudo (spec rule). Ask the user to run root commands with `! cmd`.
 - Kali's `/usr/bin/pulseaudio` has **no `module-sles-source`** (the phone mic). `stt` deliberately uses **Termux's**
   `/data/data/com.termux/files/usr/bin/pulseaudio`, on its own private server (tcp 127.0.0.1:4714), killed on exit.
   A separate pulseaudio the user already had running (port 4713, pid ~12594) is **not ours — never kill it.**
@@ -30,6 +32,7 @@ A command `stt` that transcribes speech fully offline with sherpa-onnx (int8 mod
 - 4 cores (`nproc`), 15 GB RAM. For these models 2 threads is usually faster than 4 (big.LITTLE oversubscription).
 - Shell gotchas: `pkill -f <pattern>` matches the agent's own shell command line and kills it (exit 144) — use `pgrep -a` + `kill PID`.
   Use `python -I` when running anything near downloaded files. Scratch dir: `/tmp/claude-100000/` (not the project dir).
+</linux_notes>
 
 ## 3. Layout
 | What | Where |
