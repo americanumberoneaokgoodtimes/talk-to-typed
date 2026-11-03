@@ -1,16 +1,56 @@
-__pycache__/
-*.egg-info/
-.venv/
-venv/
+# Build artifacts
 dist/
 build/
-dist_standalone/
-build_standalone/
-# never commit voice recordings, audio, or models
-captures/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment and virtual environments
+.env
+.venv/
+venv/
+env/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.swn
+.vscode/
+.vs/
+.idea/
+*.workspace
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.cache
+temp/
+.cache/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Media test files (user captures)
 *.wav
 *.mp3
 *.m4a
+*.flac
 *.ogg
-*.onnx
-*.tar.bz2
+*.webm
+
+# Logs and dumps
+dump/
+crash_dumps/
+
+# Models (downloaded at runtime)
+models/
