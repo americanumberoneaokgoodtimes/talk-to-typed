@@ -319,7 +319,9 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     try:
         cfg_g = dict(cfg, robust_denoiser="gtcrn_simple.onnx")
         gtcrn_arr = audio.denoise(hp, cfg_g)
-        # Spectral crossover hybrid: GTCRN clean low-band + HP pristine high-band consonants
+        # Retain pure neural GTCRN for deep sub-noise vowel/formant extraction
+        models.append(("gtcrn", gtcrn_arr))
+        # Add spectral crossover hybrid for crisp high-band consonant preservation
         hybrid_crossover = audio.spectral_crossover_blend(gtcrn_arr, hp)
         models.append(("hybrid", hybrid_crossover))
     except Exception as e:
@@ -488,7 +490,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         for name, item in zip(cand_names, cand_details):
             words, sc, _ = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
             if words:
-                w_weight = 0.40 if "hybrid" in name else (0.35 if "dp4" in name else 0.25)
+                w_weight = 0.35 if name in ("gtcrn", "hybrid") else (0.30 if "dp4" in name else 0.25)
                 rover_inputs.append({"words": words, "model": name, "weight": w_weight})
 
         fused_words = cn_rover_fuse(rover_inputs, core_dur_sec)
