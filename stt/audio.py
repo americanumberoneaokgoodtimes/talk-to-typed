@@ -1,4 +1,5 @@
 """Audio helpers: ffmpeg decoding and Silero VAD segmentation."""
+import re
 import shutil
 import subprocess
 import sys
@@ -11,18 +12,135 @@ import sherpa_onnx
 SR = 16000
 
 
-def decode(path: str) -> np.ndarray | None:
+def parse_time_spec(spec: str) -> float:
+    """Parse a single time specification into seconds as float.
+
+    Supports:
+      - Unit-tagged strings: '00h00m07s635z', '7s635z', '1m30s', '500ms', '10s'
+        where h=hours, m=minutes, s=seconds, z/ms=milliseconds.
+      - Clock formats: '01:23:45.678', '00:07.635', '1:30'
+      - Raw numbers: '7.635', '10'
+    """
+    s = spec.strip().lower()
+    if not s:
+        raise ValueError("Empty time specification")
+    if s.startswith("-"):
+        raise ValueError(f"Time value cannot be negative: {spec!r}")
+
+    # 1. Unit-tagged format (e.g. '00h00m07s635z', '7s635z', '1m30s', '10s')
+    unit_matches = re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+)", s)
+    if unit_matches:
+        leftover = re.sub(r"(\d+(?:\.\d+)?)\s*([a-z]+)", "", s).strip()
+        if not leftover:
+            total_sec = 0.0
+            unit_map = {
+                "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
+                "m": 60.0, "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
+                "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
+                "z": 0.001, "ms": 0.001, "msec": 0.001, "millis": 0.001,
+            }
+            for val_str, u in unit_matches:
+                if u in unit_map:
+                    total_sec += float(val_str) * unit_map[u]
+                else:
+                    raise ValueError(f"Unknown time unit '{u}' in '{spec}'")
+            return total_sec
+
+    # 2. Clock format: HH:MM:SS.mmm or MM:SS.mmm
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 3:
+            h = float(parts[0])
+            m = float(parts[1])
+            sec = float(parts[2])
+            return h * 3600.0 + m * 60.0 + sec
+        elif len(parts) == 2:
+            m = float(parts[0])
+            sec = float(parts[1])
+            return m * 60.0 + sec
+        else:
+            raise ValueError(f"Invalid clock time format '{spec}'")
+
+    # 3. Pure numeric (seconds)
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(
+            f"Could not parse time value '{spec}'. Examples: '00h00m07s635z', '07s635z', '1:30', '10s'"
+        )
+
+
+def parse_time_range(range_str: str) -> tuple[float, float | None]:
+    """Parse a time range string into (start_sec, end_sec).
+
+    Supports formats like:
+      - '00h00m07s635z-00h00m10s000z'
+      - '07s635z-10s'
+      - '7s-10s'
+      - '00:07.635-00:10.000'
+      - '7.635-10.0'
+      - '-10s' (from beginning up to 10s)
+      - '7s-' (from 7s to end of file)
+      - '7s..10s', '7s to 10s'
+    """
+    s = range_str.strip()
+    if not s:
+        raise ValueError("Empty time range")
+
+    # Normalize delimiters
+    delimiters = [" to ", " TO ", "To ", " - ", "..", ","]
+    for d in delimiters:
+        if d in s:
+            s = s.replace(d, "-")
+            break
+
+    # Handle open ranges or dash-separated ranges
+    if s.startswith("-"):
+        start_sec = 0.0
+        end_sec = parse_time_spec(s[1:])
+    elif s.endswith("-"):
+        start_sec = parse_time_spec(s[:-1])
+        end_sec = None
+    elif "-" in s:
+        parts = s.split("-", 1)
+        start_sec = parse_time_spec(parts[0])
+        end_sec = parse_time_spec(parts[1])
+    else:
+        # Single time given e.g. "7s" -> from 7s to end
+        start_sec = parse_time_spec(s)
+        end_sec = None
+
+    if end_sec is not None and end_sec <= start_sec:
+        raise ValueError(
+            f"Invalid time range: end time ({end_sec:.3f}s) must be greater than start time ({start_sec:.3f}s)"
+        )
+
+    return start_sec, end_sec
+
+
+def decode(
+    path: str,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> np.ndarray | None:
     """Decode any ffmpeg-readable file to 16 kHz mono float32.
-    
+
+    If start_sec or end_sec are provided, only that time range is extracted using ffmpeg.
     Returns None if the file is empty/corrupt and cannot be decoded.
     """
-    import struct
     ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe") or "ffmpeg"
+    cmd = [ffmpeg_bin, "-v", "error", "-nostdin"]
+    if start_sec is not None and start_sec > 0:
+        cmd.extend(["-ss", f"{start_sec:.3f}"])
+    cmd.extend(["-i", path, "-vn"])
+    if end_sec is not None:
+        dur = end_sec - (start_sec or 0.0)
+        if dur > 0:
+            cmd.extend(["-t", f"{dur:.3f}"])
+    cmd.extend(["-f", "f32le", "-ac", "1", "-ar", str(SR), "-"])
+
     try:
-        p = subprocess.run(
-            [ffmpeg_bin, "-v", "error", "-nostdin", "-i", path, "-vn", "-f", "f32le", "-ac", "1", "-ar", str(SR), "-"],
-            capture_output=True,
-        )
+        p = subprocess.run(cmd, capture_output=True)
     except FileNotFoundError:
         raise RuntimeError("ffmpeg binary not found on PATH. Please install ffmpeg.")
     if p.returncode != 0:

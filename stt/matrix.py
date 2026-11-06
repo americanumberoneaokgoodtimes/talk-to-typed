@@ -218,6 +218,7 @@ def run_matrix(
     audio_path: str = "",
     threads: int | None = None,
     progress_cb=None,
+    time_offset: float = 0.0,
 ) -> list[dict]:
     """Execute matrix transcription across all combinations and output color-coded streams."""
     sr = audio.SR
@@ -275,7 +276,8 @@ def run_matrix(
         print(f"\033[1;37m{title}\033[0m", file=sys.stderr)
     else:
         print(title, file=sys.stderr)
-    print(f"File: {audio_path} ({dur_sec:.1f}s) | Rumble: {prof.rumble_fraction*100:.1f}% | Hum: {prof.hum_freq or 'None'}", file=sys.stderr)
+    range_info = f" | Offset: +{time_offset:.3f}s" if time_offset > 0 else ""
+    print(f"File: {audio_path} ({dur_sec:.1f}s){range_info} | Rumble: {prof.rumble_fraction*100:.1f}% | Hum: {prof.hum_freq or 'None'}", file=sys.stderr)
     print("=" * 88 + "\n", file=sys.stderr)
 
     vad_cfg = dict(cfg, vad_threshold=0.35, vad_min_speech=0.10, vad_max_speech=10.0, vad_min_silence=0.25)
@@ -303,7 +305,7 @@ def run_matrix(
                     None, samples, cfg, params=auto_params, threads=threads
                 )
                 for s, e, t in triples:
-                    results.append({"start": s, "end": e, "text": t})
+                    results.append({"start": s + time_offset, "end": e + time_offset, "text": t})
             except Exception as e:
                 print(f"{c_pfx}  [Ensemble error: {e}]{c_sfx}", flush=True)
 
@@ -312,7 +314,7 @@ def run_matrix(
             norm_sig = audio.normalize(sig)
             segs = list(audio.segments(norm_sig, vad_cfg))
 
-            # If VAD finds segments, use them; if noisy audio blinds VAD, use 5s sliding windows
+            # If VAD finds segments, use them; if noisy audio blinds VAD, use sliding windows or full chunk
             chunks_with_time = []
             if segs:
                 for s, e, c in segs:
@@ -320,8 +322,11 @@ def run_matrix(
             else:
                 win_samples = int(5.0 * sr)
                 step_samples = int(2.5 * sr)
-                for i in range(0, len(sig) - win_samples + 1, step_samples):
-                    chunks_with_time.append((i / sr, (i + win_samples) / sr, sig[i : i + win_samples]))
+                if len(sig) <= win_samples:
+                    chunks_with_time.append((0.0, len(sig) / sr, sig))
+                else:
+                    for i in range(0, len(sig) - win_samples + 1, step_samples):
+                        chunks_with_time.append((i / sr, (i + win_samples) / sr, sig[i : i + win_samples]))
 
             if combo["type"] == "offline":
                 method = "modified_beam_search" if combo.get("beam") else "greedy_search"
@@ -340,7 +345,7 @@ def run_matrix(
                     rec.decode_stream(st)
                     t = st.result.text.strip()
                     if t:
-                        results.append({"start": s, "end": e, "text": t})
+                        results.append({"start": s + time_offset, "end": e + time_offset, "text": t})
 
             elif combo["type"] == "streaming":
                 import sherpa_onnx
@@ -364,7 +369,7 @@ def run_matrix(
                         rec.decode_stream(st)
                     t = rec.get_result(st).strip()
                     if t:
-                        results.append({"start": s, "end": e, "text": t})
+                        results.append({"start": s + time_offset, "end": e + time_offset, "text": t})
 
         elapsed = time.time() - t0
 

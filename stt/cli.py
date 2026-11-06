@@ -502,8 +502,19 @@ def cmd_file(args, cfg):
             if total_files > 1 and not args.jsonl:
                 print(f"\n[stt file {idx + 1}/{total_files}] Processing: {path}", file=sys.stderr)
 
+            time_offset = 0.0
+            range_arg = getattr(args, "range", None)
+            start_sec = None
+            end_sec = None
+            if range_arg:
+                try:
+                    start_sec, end_sec = audio.parse_time_range(range_arg)
+                    time_offset = start_sec
+                except ValueError as ve:
+                    sys.exit(f"[stt] error: invalid --range {range_arg!r}: {ve}")
+
             try:
-                samples = audio.decode(path)
+                samples = audio.decode(path, start_sec=start_sec, end_sec=end_sec)
             except RuntimeError as e:
                 print(f"error: {e}", file=sys.stderr)
                 continue
@@ -515,7 +526,7 @@ def cmd_file(args, cfg):
 
             if is_all:
                 from . import matrix
-                matrix.run_matrix(samples, cfg, audio_path=path, threads=args.threads)
+                matrix.run_matrix(samples, cfg, audio_path=path, threads=args.threads, time_offset=time_offset)
                 total_audio += dur
                 total_proc += time.time() - t
                 continue
@@ -580,6 +591,12 @@ def cmd_file(args, cfg):
                 else:
                     # Standard English-only transcription
                     triples = robust.transcribe(rec, samples, cfg, level, subnoise=False, no_fallback=no_fallback)
+
+            if time_offset > 0 and triples:
+                if len(triples[0]) == 4:
+                    triples = [(s + time_offset, e + time_offset, src, tgt) for s, e, src, tgt in triples]
+                else:
+                    triples = [(s + time_offset, e + time_offset, text) for s, e, text in triples]
 
             dt = time.time() - t
             total_audio += dur
@@ -866,6 +883,9 @@ def main(argv=None):
   stt file recording.wav --all
       Run through ALL installed models & DSP enhancements with color-coded comparison.
 
+  stt file audio.mp3 --range 07s635z-10s --all
+      Transcribe a millisecond-exact audio slice across all model matrix configurations.
+
   stt file video.mp4 --srt --sidecar
       Generate video.srt subtitles alongside the video file.
 
@@ -915,6 +935,9 @@ def main(argv=None):
 
   stt file audio_es.wav --translate --lang-source es --lang-target en
       Transcribe Spanish speech and translate directly into English (NLLB-200).
+
+  stt file audio.mp3 --range 00h00m07s635z-00h00m10s000z --all
+      Transcribe only the specified time slice (e.g. 7s-10s) through all model combinations.
 """
     )
     g_f_pos = f.add_argument_group("POSITIONAL ARGUMENTS")
@@ -922,6 +945,8 @@ def main(argv=None):
 
     g_f_io = f.add_argument_group("INPUT & OUTPUT OPTIONS")
     g_f_io.add_argument("-r", "--recursive", action="store_true", help="recursively search directories for audio/video files")
+    g_f_io.add_argument("--range", metavar="SPEC",
+                        help="transcribe only a time range (e.g. 00h00m07s635z-00h00m10s000z, 7s-10s, 01:30-02:00, 7.5-12)")
     g_f_io.add_argument("--out", metavar="FILE", help="save transcript output to specified file")
     g_f_io.add_argument("--jsonl", action="store_true", help="output JSON lines with start/end/text")
     g_f_io.add_argument("--srt", action="store_true", help="output standard SubRip (.srt) subtitles")
