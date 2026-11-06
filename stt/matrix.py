@@ -100,6 +100,36 @@ def get_available_combinations(cfg: dict) -> list[dict]:
                 "type": "offline",
             },
             {
+                "id": "parakeet_spec_gate_beam",
+                "name": "Parakeet-TDT | Adaptive Spectral Gate | Beam-16 (BP=0.45)",
+                "category": "Offline Beam Search",
+                "model": offline_model,
+                "sig": "spec_gate",
+                "bp": 0.45,
+                "beam": True,
+                "type": "offline",
+            },
+            {
+                "id": "parakeet_formant_agc_beam",
+                "name": "Parakeet-TDT | Multiband Formant AGC | Beam-16 (BP=0.55)",
+                "category": "Offline Beam Search",
+                "model": offline_model,
+                "sig": "formant_agc",
+                "bp": 0.55,
+                "beam": True,
+                "type": "offline",
+            },
+            {
+                "id": "parakeet_gtcrn_agc_beam",
+                "name": "Parakeet-TDT | GTCRN + Multiband AGC | Beam-16 (BP=0.60)",
+                "category": "Offline Beam Search",
+                "model": offline_model,
+                "sig": "gtcrn_agc",
+                "bp": 0.60,
+                "beam": True,
+                "type": "offline",
+            },
+            {
                 "id": "parakeet_formant_eq_beam",
                 "name": "Parakeet-TDT | Formant EQ (+4dB) | Beam-16 (BP=0.70)",
                 "category": "Offline Beam Search",
@@ -255,6 +285,9 @@ def run_matrix(
 
     formant_eq = audio.speech_formant_filter(clean_hp, boost_db=4.0)
     gtcrn_eq = audio.speech_formant_filter(gtcrn, boost_db=4.0)
+    spec_gate = audio.adaptive_spectral_gate(clean_hp)
+    formant_agc = audio.multiband_formant_agc(clean_hp)
+    gtcrn_agc = audio.multiband_formant_agc(gtcrn)
 
     enhancements = {
         "raw": samples,
@@ -265,6 +298,9 @@ def run_matrix(
         "dp8": dp8,
         "formant_eq": formant_eq,
         "gtcrn_eq": gtcrn_eq,
+        "spec_gate": spec_gate,
+        "formant_agc": formant_agc,
+        "gtcrn_agc": gtcrn_agc,
     }
 
     combos = get_available_combinations(cfg)

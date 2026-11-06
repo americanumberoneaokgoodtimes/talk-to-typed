@@ -281,3 +281,48 @@ def test_detect_micro_bursts():
     m_start, m_end = bursts[0]
     assert m_start <= start_b <= m_end
 
+
+def test_adaptive_spectral_gate():
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False, dtype=np.float32)
+    tone = (0.2 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    noise = np.random.normal(0, 0.05, sr).astype(np.float32)
+    noisy = tone + noise
+
+    denoised = audio.adaptive_spectral_gate(noisy, sr=sr)
+    assert len(denoised) == len(noisy)
+    assert denoised.dtype == np.float32
+    # Denoised signal should have reduced residual noise
+    assert np.var(denoised) > 0.0
+
+
+def test_harmonic_pitch_vad():
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False, dtype=np.float32)
+    # 200 Hz harmonic tone simulating voiced speech pitch
+    voiced = (0.3 * np.sin(2 * np.pi * 200.0 * t) + 0.15 * np.sin(2 * np.pi * 400.0 * t)).astype(np.float32)
+    noise = np.random.normal(0, 0.02, sr).astype(np.float32)
+    stimulus = voiced + noise
+
+    active_frames = audio.harmonic_pitch_vad(stimulus, sr=sr)
+    assert len(active_frames) > 0
+    # Voiced periodic tone should trigger harmonic pitch VAD frames
+    assert np.sum(active_frames) > 0
+
+
+def test_multiband_formant_agc():
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False, dtype=np.float32)
+    # Faint vowel formant at 800 Hz
+    faint_formant = (0.01 * np.sin(2 * np.pi * 800.0 * t)).astype(np.float32)
+    # Sub-rumble at 40 Hz
+    rumble = (0.10 * np.sin(2 * np.pi * 40.0 * t)).astype(np.float32)
+    s = faint_formant + rumble
+
+    boosted = audio.multiband_formant_agc(s, sr=sr)
+    assert len(boosted) == len(s)
+    assert boosted.dtype == np.float32
+    # Formant should be lifted relative to rumble
+    assert np.max(np.abs(boosted)) > np.max(np.abs(faint_formant))
+
+

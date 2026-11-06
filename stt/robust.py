@@ -407,7 +407,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     if boost_db > 0.0:
         hp = audio.speech_formant_filter(hp, boost_db=boost_db)
 
-    # 2. Multi-model enhancement candidates with High-Band Spectral Crossover Blending
+    # 2. Multi-model enhancement candidates with High-Band Spectral Crossover Blending & Pure-NumPy DSP
     models = []
     gtcrn_arr = None
     try:
@@ -426,6 +426,13 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         models.append(("dp4", audio.denoise(hp, cfg_d4)))
     except Exception as e:
         print(f"[stt] Warning: DPDFNet4 denoiser unavailable: {e}", file=sys.stderr)
+
+    # Pure-NumPy adaptive decision-directed Wiener filter and 3-band formant AGC
+    try:
+        models.append(("spec_gate", audio.adaptive_spectral_gate(hp)))
+        models.append(("formant_agc", audio.multiband_formant_agc(hp)))
+    except Exception as e:
+        print(f"[stt] Warning: Pure-NumPy DSP filters unavailable: {e}", file=sys.stderr)
 
     models.append(("hp", hp))
 
@@ -500,6 +507,12 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                     "global_end": round(ext_start_sec + w["end"], 3),
                     "conf": item.get("confidence", 0.5),
                 })
+
+        # Prior token collapse check (e.g. ungrounded "Thank you.", "Okay.")
+        clean_text_lower = " ".join(w["word"] for w in core_words).strip(".,?!;:\"'").lower()
+        if clean_text_lower in ("thank you", "thanks", "remember to like and subscribe", "like and subscribe", "bye"):
+            if item.get("confidence", 0.5) < 0.65 or item.get("zero_skip_ratio", 0.0) > 0.25:
+                return [], -10.0, "prior collapse hallucination"
 
         text = " ".join(w["word"] for w in core_words)
         sc, reason = score_coherence(text, core_dur_sec)
