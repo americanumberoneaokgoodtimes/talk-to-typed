@@ -126,3 +126,57 @@ def test_subnoise_transcribe_deduplication():
     cfg = dict(config.DEFAULTS)
     res_empty = robust.subnoise_transcribe(mock_rec, np.array([], dtype=np.float32), cfg)
     assert res_empty == []
+
+
+def test_score_coherence_short_clip_relaxation():
+    # Short 2-word phrase in 0.5s (4 wps, relaxed up to 8.0 wps)
+    score, reason = robust.score_coherence("Yes please", 0.5)
+    assert score > 0.0
+    assert reason == "coherent"
+
+
+def test_cn_rover_fuse():
+    # Empty candidate list
+    assert robust.cn_rover_fuse([], 2.0) == []
+
+    # Stream 1 has "I", "am", "here"
+    s1 = {
+        "model": "hybrid",
+        "weight": 0.40,
+        "words": [
+            {"word": "I", "global_start": 0.1, "global_end": 0.3, "conf": 0.9},
+            {"word": "am", "global_start": 0.35, "global_end": 0.5, "conf": 0.85},
+            {"word": "here.", "global_start": 0.55, "global_end": 0.9, "conf": 0.92},
+        ],
+    }
+    # Stream 2 missed "I", but has "am", "here"
+    s2 = {
+        "model": "dp4",
+        "weight": 0.35,
+        "words": [
+            {"word": "am", "global_start": 0.36, "global_end": 0.52, "conf": 0.80},
+            {"word": "here", "global_start": 0.56, "global_end": 0.88, "conf": 0.88},
+        ],
+    }
+
+    fused = robust.cn_rover_fuse([s1, s2], 1.5)
+    assert len(fused) == 3
+    assert fused[0]["word"] == "I"
+    assert fused[1]["word"] == "am"
+    assert "here" in fused[2]["word"]
+
+
+def test_merge_words_morphological():
+    emitted = [{"word": "Like", "global_start": 0.0, "global_end": 0.4}]
+    # 1. Duplicate within 0.45s
+    new_words = [{"word": "like", "global_start": 0.05, "global_end": 0.42}]
+    robust.merge_words_morphological(emitted, new_words)
+    assert len(emitted) == 1
+
+    # 2. Prefix expansion: "pur" -> "purse"
+    emitted.append({"word": "pur", "global_start": 0.8, "global_end": 1.1})
+    new_words2 = [{"word": "purse.", "global_start": 0.82, "global_end": 1.25}]
+    robust.merge_words_morphological(emitted, new_words2)
+    assert len(emitted) == 2
+    assert emitted[1]["word"] == "purse."
+

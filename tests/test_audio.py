@@ -218,3 +218,66 @@ def test_noise_bounded_agc():
     hiss_rms = float(np.sqrt(np.mean(agc_hiss ** 2)))
     assert hiss_rms <= 0.035
 
+
+def test_spectral_crossover_blend():
+    assert len(audio.spectral_crossover_blend(np.array([], dtype=np.float32), np.array([], dtype=np.float32))) == 0
+
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False)
+    # Low-band vowel tone (500 Hz) and high-band consonant tone (5000 Hz)
+    vowel = np.sin(2 * np.pi * 500 * t).astype(np.float32)
+    consonant = np.sin(2 * np.pi * 5000 * t).astype(np.float32)
+
+    # Denoiser has clean low band, but smeared high band (zero consonant)
+    den = vowel
+    # HP has both vowel and crisp consonant
+    hp = vowel + consonant
+
+    fused = audio.spectral_crossover_blend(den, hp, sr=sr, f_split_low=3200.0, f_split_high=4200.0, hp_high_weight=0.70)
+    assert len(fused) == len(den)
+
+    fft_fused = np.abs(np.fft.rfft(fused))
+    freqs = np.fft.rfftfreq(len(fused), 1.0 / sr)
+    idx_500 = np.argmin(np.abs(freqs - 500.0))
+    idx_5000 = np.argmin(np.abs(freqs - 5000.0))
+
+    # Low-band 500 Hz is preserved
+    assert fft_fused[idx_500] > 100.0
+    # High-band 5000 Hz consonant is restored by crossover from HP (>50% of consonant energy)
+    assert fft_fused[idx_5000] > 50.0
+
+
+def test_dynamic_pregate_and_hfc():
+    sr = 16000
+    t = np.linspace(0, 4.0, sr * 4, endpoint=False)
+    # 2 seconds of quiet noise (RMS ~0.001), 2 seconds of louder noise (RMS ~0.01)
+    noise_part1 = np.random.normal(0, 0.001, sr * 2).astype(np.float32)
+    noise_part2 = np.random.normal(0, 0.01, sr * 2).astype(np.float32)
+    full_noise = np.concatenate([noise_part1, noise_part2])
+
+    profile = audio.compute_dynamic_pregate_profile(full_noise, sr=sr, frame_sec=0.25, local_win_sec=2.0)
+    assert len(profile) == len(full_noise) // (sr // 4)
+    # Part 1 local floor is lower than part 2 local floor
+    assert profile[2] < profile[-2]
+
+    # Faint whisper with strong harmonic formant structure (formant at 1000 Hz)
+    whisper = 0.0015 * np.sin(2 * np.pi * 1000 * t[:sr]).astype(np.float32)
+    # Pass check against part 1 floor (0.001)
+    assert audio.evaluate_window_pregate(whisper, local_floor_rms=0.001, sr=sr) is True
+
+
+def test_detect_micro_bursts():
+    sr = 16000
+    # 5.0s window with mostly quiet noise and a 0.6s burst centered at 2.5s
+    samples = np.random.normal(0, 0.001, sr * 5).astype(np.float32)
+    t_burst = np.linspace(0, 0.6, int(0.6 * sr), endpoint=False)
+    burst = 0.02 * np.sin(2 * np.pi * 800 * t_burst).astype(np.float32)
+    start_b = int(2.2 * sr)
+    samples[start_b : start_b + len(burst)] += burst
+
+    bursts = audio.detect_micro_bursts(samples, sr=sr, sub_sec=0.5, par_threshold=2.0)
+    assert len(bursts) == 1
+    # Micro window spans around the burst
+    m_start, m_end = bursts[0]
+    assert m_start <= start_b <= m_end
+

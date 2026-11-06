@@ -115,8 +115,9 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
     if not words:
         return 0.0, "empty"
 
-    wps = len(words) / max(dur_sec, 0.5)
-    if wps > 5.0:
+    wps_max = 8.0 if (dur_sec < 1.2 or len(words) <= 3) else 5.0
+    wps = len(words) / max(dur_sec, 0.4)
+    if wps > wps_max:
         return -5.0, f"too fast / hallucination ({wps:.1f} wps)"
 
     from collections import Counter
@@ -148,6 +149,126 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
     ttr = len(counts) / len(words)
     fitness = (len(counts) * 2.5) + (ttr * 6.0) - (dom_ratio * 4.0)
     return round(fitness, 2), "coherent"
+
+
+def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
+    """Time-synchronous Confusion Network ROVER hypothesis fusion across candidate streams."""
+    valid_streams = [s for s in stream_candidates if s.get("words")]
+    if not valid_streams:
+        return []
+    if len(valid_streams) == 1:
+        return valid_streams[0]["words"]
+
+    tagged_words = []
+    for s_idx, stream in enumerate(valid_streams):
+        w_weight = stream.get("weight", 1.0)
+        for w in stream["words"]:
+            tagged_words.append({
+                "word": w["word"],
+                "start": w["global_start"],
+                "end": w["global_end"],
+                "conf": w.get("conf", 0.5),
+                "stream_idx": s_idx,
+                "stream_weight": w_weight,
+            })
+
+    if not tagged_words:
+        return []
+
+    tagged_words.sort(key=lambda x: x["start"])
+    slots = []
+    for tw in tagged_words:
+        placed = False
+        for slot in slots:
+            slot_start = min(w["start"] for w in slot)
+            slot_end = max(w["end"] for w in slot)
+            overlap = max(0.0, min(slot_end, tw["end"]) - max(slot_start, tw["start"]))
+            duration = max(slot_end, tw["end"]) - min(slot_start, tw["start"])
+            iou = overlap / max(duration, 1e-6)
+            center_dist = abs(((tw["start"] + tw["end"]) / 2.0) - ((slot_start + slot_end) / 2.0))
+            if iou >= 0.20 or center_dist <= 0.28:
+                if not any(w["stream_idx"] == tw["stream_idx"] for w in slot):
+                    slot.append(tw)
+                    placed = True
+                    break
+        if not placed:
+            slots.append([tw])
+
+    fused_words = []
+    n_streams = len(valid_streams)
+    for slot in slots:
+        grouped = {}
+        for w in slot:
+            clean = w["word"].strip(".,?!;:\"'()").lower()
+            if not clean:
+                continue
+            if clean not in grouped:
+                grouped[clean] = {"voters": set(), "weights": 0.0, "confs": [], "words": [], "starts": [], "ends": []}
+            grouped[clean]["voters"].add(w["stream_idx"])
+            grouped[clean]["weights"] += w["stream_weight"]
+            grouped[clean]["confs"].append(w["conf"])
+            grouped[clean]["words"].append(w["word"])
+            grouped[clean]["starts"].append(w["start"])
+            grouped[clean]["ends"].append(w["end"])
+
+        if not grouped:
+            continue
+
+        best_clean = None
+        best_score = -1.0
+        for clean, data in grouped.items():
+            vote_frac = len(data["voters"]) / n_streams
+            mean_conf = float(np.mean(data["confs"])) if data["confs"] else 0.5
+            score = 0.40 * vote_frac + 0.60 * mean_conf
+            if len(data["voters"]) == 1 and mean_conf < 0.55:
+                continue
+            if score > best_score:
+                best_score = score
+                best_clean = clean
+
+        if best_clean is not None:
+            data = grouped[best_clean]
+            best_repr = max(data["words"], key=lambda x: (len(x), x[0].isupper()))
+            fused_words.append({
+                "word": best_repr,
+                "global_start": round(float(np.median(data["starts"])), 3),
+                "global_end": round(float(np.median(data["ends"])), 3),
+                "conf": float(np.mean(data["confs"])),
+            })
+
+    fused_words.sort(key=lambda x: x["global_start"])
+    return fused_words
+
+
+def merge_words_morphological(emitted: list[dict], new_words: list[dict]):
+    """Merge newly detected words into global sequence with morphological prefix/suffix splicing."""
+    for nw in new_words:
+        nw_clean = nw["word"].strip(".,?!;:\"'()").lower()
+        if not nw_clean:
+            continue
+
+        duplicate = False
+        for idx in range(len(emitted) - 1, max(-1, len(emitted) - 8), -1):
+            past = emitted[idx]
+            past_clean = past["word"].strip(".,?!;:\"'()").lower()
+            t_diff = abs(past["global_start"] - nw["global_start"])
+
+            if t_diff <= 0.45:
+                if past_clean == nw_clean:
+                    if len(nw["word"]) > len(past["word"]) and not past["word"][-1] in ".,?!;:":
+                        past["word"] = nw["word"]
+                    duplicate = True
+                    break
+
+                if past_clean.startswith(nw_clean) or nw_clean.startswith(past_clean):
+                    if len(nw_clean) > len(past_clean):
+                        past["word"] = nw["word"]
+                        past["global_end"] = max(past["global_end"], nw["global_end"])
+                    duplicate = True
+                    break
+
+        if not duplicate:
+            emitted.append(nw)
 
 
 def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None = None, progress_cb=None, model: str | None = None, threads: int | None = None) -> list[tuple[float, float, str]]:
@@ -192,18 +313,24 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     if boost_db > 0.0:
         hp = audio.speech_formant_filter(hp, boost_db=boost_db)
 
-    # 2. Multi-model enhancement candidates
+    # 2. Multi-model enhancement candidates with High-Band Spectral Crossover Blending
     models = []
+    gtcrn_arr = None
     try:
         cfg_g = dict(cfg, robust_denoiser="gtcrn_simple.onnx")
-        models.append(("gtcrn", audio.denoise(hp, cfg_g)))
+        gtcrn_arr = audio.denoise(hp, cfg_g)
+        # Spectral crossover hybrid: GTCRN clean low-band + HP pristine high-band consonants
+        hybrid_crossover = audio.spectral_crossover_blend(gtcrn_arr, hp)
+        models.append(("hybrid", hybrid_crossover))
     except Exception as e:
         print(f"[stt] Warning: GTCRN denoiser unavailable: {e}", file=sys.stderr)
+
     try:
         cfg_d4 = dict(cfg, robust_denoiser="dpdfnet4.onnx")
         models.append(("dp4", audio.denoise(hp, cfg_d4)))
     except Exception as e:
         print(f"[stt] Warning: DPDFNet4 denoiser unavailable: {e}", file=sys.stderr)
+
     models.append(("hp", hp))
 
     if len(models) == 1:
@@ -211,7 +338,15 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     else:
         print(f"[stt] Subnoise: using {len(models)} enhancement models: {[m[0] for m in models]}", file=sys.stderr)
 
-    # 3. Sliding window formant scan with context margins and speech-band pre-gating
+    # Pre-compute continuous local noise floor envelope for dynamic pre-gating
+    local_noise_floor = audio.compute_dynamic_pregate_profile(hp)
+
+    # Quantized 3-tier blank penalty recognizer pool
+    rec_t1 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=0.35)
+    rec_t2 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=float(bp or 0.65))
+    rec_t3 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=min(1.15, float(bp or 0.65) + 0.25))
+
+    # 3. Sliding window formant scan with context margins and dynamic pre-gating
     if len(samples) <= win_len:
         windows = [(0, len(samples))]
     else:
@@ -224,8 +359,8 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     raw_hits = []
     emitted_words = []
     total_wins = len(windows)
-    escalated_rec = None
     skipped_pregate = 0
+    fast_exits = 0
 
     # Progress throttling
     last_progress_time = 0.0
@@ -267,6 +402,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                     "word": w["word"],
                     "global_start": round(ext_start_sec + w["start"], 3),
                     "global_end": round(ext_start_sec + w["end"], 3),
+                    "conf": item.get("confidence", 0.5),
                 })
 
         text = " ".join(w["word"] for w in core_words)
@@ -288,12 +424,24 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                 last_progress_pct = pct
                 last_progress_time = now
 
-        # Adaptive speech-band energy pre-gate on core window
+        # Tier 0: Dynamic local noise floor and HFC pre-gate
+        f_idx = min(len(local_noise_floor) - 1, int(t0 / 0.25))
+        local_floor_rms = float(local_noise_floor[f_idx])
         window_raw = hp[start_idx:end_idx]
-        sb_rms = audio.speech_band_energy(window_raw)
-        if sb_rms < pregate:
+
+        if not audio.evaluate_window_pregate(window_raw, local_floor_rms):
             skipped_pregate += 1
             continue
+
+        # Compute physical window SNR to select blank penalty tier
+        win_rms = float(np.sqrt(np.mean(window_raw ** 2) + 1e-12))
+        local_snr_db = 20.0 * np.log10(max(win_rms, 1e-6) / max(local_floor_rms, 1e-6))
+        if local_snr_db >= 10.0:
+            active_rec = rec_t1
+        elif local_snr_db >= 2.0:
+            active_rec = rec_t2
+        else:
+            active_rec = rec_t3
 
         # Context-extended slice with 50ms outer Tukey edge fades
         ext_start = max(0, start_idx - margin_samples)
@@ -302,76 +450,87 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         core_dur_sec = (end_idx - start_idx) / audio.SR
         ext_start_sec = ext_start / audio.SR
 
-        cand_chunks = []
-        for _, audio_arr in models:
+        # Helper to prepare sliced AGC chunk
+        def prepare_chunk(audio_arr):
             c = audio_arr[ext_start:ext_end].copy()
             if ext_start > 0 and len(c) > fade_samples:
                 c[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
             if ext_end < len(samples) and len(c) > fade_samples:
                 c[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
-            c = audio.noise_bounded_agc(c, noise_floor_rms=prof.noise_floor_rms)
-            cand_chunks.append(c)
+            return audio.noise_bounded_agc(c, noise_floor_rms=prof.noise_floor_rms)
 
+        # Tier 1: Single-Stream Primary Probe (Hybrid Crossover)
+        probe_chunk = prepare_chunk(models[0][1])
+        probe_details = asr.transcribe_batch_detailed(active_rec, [probe_chunk])
+        probe_item = probe_details[0] if probe_details else {}
+        probe_words, probe_sc, _ = extract_core_words(probe_item, left_margin_sec, core_dur_sec, ext_start_sec)
+        probe_txt = " ".join(w["word"] for w in probe_words).strip()
+
+        # Tier 1 Fast-Accept Check: High confidence, low zero-skip ratio, healthy lexical fitness
+        if probe_txt and probe_item.get("confidence", 0.0) >= 0.65 and probe_item.get("zero_skip_ratio", 0.0) <= 0.35 and probe_sc > 1.0:
+            raw_hits.append((round(t0, 2), round(t1, 2), probe_txt))
+            merge_words_morphological(emitted_words, probe_words)
+            fast_exits += 1
+            if idx % max(1, total_wins // 10) == 0 or idx == total_wins - 1:
+                print(f"[stt] Subnoise window {idx+1}/{total_wins}: '{probe_txt[:60]}...' "
+                      f"(score={probe_sc:.1f}, model={models[0][0]}+fast)", file=sys.stderr)
+            continue
+
+        # Tier 2: Escalation (Ambiguous / Faint / Micro-Burst)
+        cand_chunks = [prepare_chunk(audio_arr) for _, audio_arr in models]
         cand_names = [name for name, _ in models]
 
-        # Batch-decode all candidates in parallel across streams
-        cand_details = asr.transcribe_batch_detailed(rec, cand_chunks)
+        # Use Tier 3 escalated recognizer if signal is near noise floor or Tier 1 was empty
+        escalate_rec = rec_t3 if (local_snr_db < 3.0 or not probe_txt) else active_rec
+        cand_details = asr.transcribe_batch_detailed(escalate_rec, cand_chunks)
 
-        best_words = []
-        best_score = -1.0
-        best_text = ""
-        best_model = ""
-
+        rover_inputs = []
         for name, item in zip(cand_names, cand_details):
-            words, sc, reason = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
-            txt = " ".join(w["word"] for w in words).strip()
-            if txt and sc > best_score:
-                best_score = sc
-                best_words = words
-                best_text = txt
-                best_model = name
+            words, sc, _ = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
+            if words:
+                w_weight = 0.40 if "hybrid" in name else (0.35 if "dp4" in name else 0.25)
+                rover_inputs.append({"words": words, "model": name, "weight": w_weight})
 
-        # Dynamic two-stage blank penalty escalation:
-        if not best_text and sb_rms > pregate * 1.5:
-            if escalated_rec is None:
-                try:
-                    esc_bp = min(1.15, float(bp or 0.6) + 0.35)
-                    escalated_rec = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=esc_bp)
-                except Exception:
-                    escalated_rec = rec
-            if escalated_rec is not rec:
-                esc_details = asr.transcribe_batch_detailed(escalated_rec, cand_chunks)
-                for name, item in zip(cand_names, esc_details):
-                    words, sc, reason = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
-                    txt = " ".join(w["word"] for w in words).strip()
-                    if txt and sc > best_score:
-                        best_score = sc
-                        best_words = words
-                        best_text = txt
-                        best_model = f"{name}+esc"
+        fused_words = cn_rover_fuse(rover_inputs, core_dur_sec)
+        fused_txt = " ".join(w["word"] for w in fused_words).strip()
+        sc_fused, _ = score_coherence(fused_txt, core_dur_sec) if fused_txt else (0.0, "empty")
 
-        if best_text and best_score > 0.5:
-            raw_hits.append((round(t0, 2), round(t1, 2), best_text))
-            # Merge winning words into global word stream with fuzzy duplicate check
-            for cw in best_words:
-                cw_clean = cw["word"].strip(".,?!;:\"'()").lower()
-                duplicate = False
-                for past_w in reversed(emitted_words[-8:]):
-                    if abs(past_w["global_start"] - cw["global_start"]) <= 0.35:
-                        past_clean = past_w["word"].strip(".,?!;:\"'()").lower()
-                        if cw_clean == past_clean:
-                            duplicate = True
-                            break
-                if not duplicate:
-                    emitted_words.append(cw)
-
+        if fused_txt and sc_fused > 0.5:
+            raw_hits.append((round(t0, 2), round(t1, 2), fused_txt))
+            merge_words_morphological(emitted_words, fused_words)
             if idx % max(1, total_wins // 10) == 0 or idx == total_wins - 1:
-                print(f"[stt] Subnoise window {idx+1}/{total_wins}: '{best_text[:60]}...' "
-                      f"(score={best_score:.1f}, model={best_model})", file=sys.stderr)
+                print(f"[stt] Subnoise window {idx+1}/{total_wins}: '{fused_txt[:60]}...' "
+                      f"(score={sc_fused:.1f}, model=cn_rover)", file=sys.stderr)
+        else:
+            # Targeted Micro-Burst Scan for short isolated faint words
+            bursts = audio.detect_micro_bursts(window_raw)
+            for b_start, b_end in bursts:
+                mb_start = start_idx + b_start
+                mb_end = start_idx + b_end
+                mb_ext_start = max(0, mb_start - margin_samples)
+                mb_ext_end = min(len(samples), mb_end + margin_samples)
+                mb_lmargin = (mb_start - mb_ext_start) / audio.SR
+                mb_core_dur = (mb_end - mb_start) / audio.SR
 
-    if skipped_pregate > 0:
-        print(f"[stt] Subnoise pre-gate: skipped {skipped_pregate}/{total_wins} silent/non-vocal windows "
-              f"({(skipped_pregate/total_wins)*100:.1f}% CPU saved)", file=sys.stderr)
+                mb_c = models[0][1][mb_ext_start:mb_ext_end].copy()
+                if mb_ext_start > 0 and len(mb_c) > fade_samples:
+                    mb_c[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+                if mb_ext_end < len(samples) and len(mb_c) > fade_samples:
+                    mb_c[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+                mb_c = audio.noise_bounded_agc(mb_c, noise_floor_rms=prof.noise_floor_rms)
+
+                mb_item = asr.transcribe_batch_detailed(rec_t3, [mb_c])[0]
+                mb_words, mb_sc, _ = extract_core_words(mb_item, mb_lmargin, mb_core_dur, mb_ext_start / audio.SR)
+                mb_txt = " ".join(w["word"] for w in mb_words).strip()
+                if mb_txt and mb_sc > 0.5:
+                    raw_hits.append((round(mb_start / audio.SR, 2), round(mb_end / audio.SR, 2), mb_txt))
+                    merge_words_morphological(emitted_words, mb_words)
+                    print(f"[stt] Subnoise micro-burst at {mb_start/audio.SR:.1f}s: '{mb_txt}' (score={mb_sc:.1f})", file=sys.stderr)
+                    break
+
+    if skipped_pregate > 0 or fast_exits > 0:
+        print(f"[stt] Subnoise cascade: skipped {skipped_pregate}/{total_wins} non-vocal windows, "
+              f"{fast_exits} fast-exited ({((skipped_pregate + fast_exits)/total_wins)*100:.1f}% CPU cycles saved)", file=sys.stderr)
 
     # 4. Assembly into pause-delimited segments with precise audio timestamps
     segments = []

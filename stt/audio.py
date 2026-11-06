@@ -36,6 +36,8 @@ def decode(path: str) -> np.ndarray | None:
     if len(data) == 0:
         print(f"[stt] warning: skipping empty file: {path}", file=sys.stderr)
         return None
+    if data.ndim > 1:
+        data = np.mean(data, axis=-1 if data.shape[-1] < data.shape[0] else 0).astype(np.float32)
     return data
 
 
@@ -313,6 +315,158 @@ def noise_bounded_agc(
         mask = np.abs(scaled) > 0.70
         scaled[mask] = np.sign(scaled[mask]) * (0.70 + 0.15 * np.tanh((np.abs(scaled[mask]) - 0.70) / 0.15))
     return scaled.astype(np.float32)
+
+
+def spectral_crossover_blend(
+    denoised: np.ndarray,
+    clean_hp: np.ndarray,
+    sr: int = SR,
+    f_split_low: float = 3200.0,
+    f_split_high: float = 4200.0,
+    hp_high_weight: float = 0.70,
+) -> np.ndarray:
+    """Blend neural denoiser's clean low-band (<3.2 kHz) with HP filter's crisp, un-smeared high-band consonants (>4.2 kHz).
+
+    Eliminates neural musical noise and restores fricative articulation (/s/, /sh/, /f/, /t/, /k/)
+    using a zero-phase frequency-domain raised-cosine crossover with dynamic hiss modulation.
+    """
+    if len(denoised) == 0 or len(clean_hp) == 0:
+        return denoised
+
+    m = min(len(denoised), len(clean_hp))
+    den = denoised[:m]
+    hp = clean_hp[:m]
+
+    pad_len = min(m, sr // 2)
+    den_pad = np.pad(den, pad_len, mode="reflect")
+    hp_pad = np.pad(hp, pad_len, mode="reflect")
+    n_fft = len(den_pad)
+
+    fft_den = np.fft.rfft(den_pad)
+    fft_hp = np.fft.rfft(hp_pad)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+    mask_high = np.zeros_like(freqs, dtype=np.float32)
+    ramp_idx = (freqs >= f_split_low) & (freqs < f_split_high)
+    w = (freqs[ramp_idx] - f_split_low) / (f_split_high - f_split_low)
+    mask_high[ramp_idx] = 0.5 * (1.0 - np.cos(np.pi * w))
+    mask_high[freqs >= f_split_high] = 1.0
+
+    # Stationary hiss rejection in high band: check modulation depth in 4-7 kHz
+    hiss_mask = (freqs >= 4000.0) & (freqs <= 7000.0)
+    effective_hp_weight = hp_high_weight
+    if np.any(hiss_mask):
+        hp_mag = np.abs(fft_hp[hiss_mask])
+        med = float(np.median(hp_mag) + 1e-9)
+        p90 = float(np.percentile(hp_mag, 90))
+        mod_ratio = p90 / (2.0 * med)
+        effective_hp_weight = float(hp_high_weight * np.clip(mod_ratio, 0.35, 1.0))
+
+    gain_hp = mask_high * effective_hp_weight
+    gain_den = 1.0 - gain_hp
+
+    fft_fused = (fft_den * gain_den) + (fft_hp * gain_hp)
+    fused_padded = np.fft.irfft(fft_fused, n=n_fft)
+    fused = fused_padded[pad_len : pad_len + m]
+    return fused.astype(np.float32)
+
+
+def compute_dynamic_pregate_profile(
+    hp_samples: np.ndarray,
+    sr: int = SR,
+    frame_sec: float = 0.25,
+    local_win_sec: float = 6.0,
+) -> np.ndarray:
+    """Compute continuous time-varying noise floor envelope across the audio (one threshold per 0.25s frame)."""
+    frame_len = int(frame_sec * sr)
+    n_frames = len(hp_samples) // frame_len
+    if n_frames == 0:
+        return np.array([1e-4], dtype=np.float32)
+
+    frames = hp_samples[: n_frames * frame_len].reshape(n_frames, frame_len)
+    frame_rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+
+    win_frames = max(4, int(local_win_sec / frame_sec))
+    half_win = win_frames // 2
+    local_floor = np.empty(n_frames, dtype=np.float32)
+
+    for i in range(n_frames):
+        w_start = max(0, i - half_win)
+        w_end = min(n_frames, i + half_win + 1)
+        local_floor[i] = float(np.percentile(frame_rms[w_start:w_end], 15))
+
+    return local_floor
+
+
+def evaluate_window_pregate(
+    window_samples: np.ndarray,
+    local_floor_rms: float,
+    sr: int = SR,
+) -> bool:
+    """Evaluate whether a window should be transcribed using local SNR and Harmonic Formant Contrast (HFC).
+
+    Allows faint whispers during quiet intervals and detects formant peaks even below broadband noise floor.
+    """
+    if len(window_samples) == 0:
+        return False
+
+    win_rms = float(np.sqrt(np.mean(window_samples ** 2) + 1e-12))
+    if win_rms >= local_floor_rms * 1.20:
+        return True
+
+    fft_mag = np.abs(np.fft.rfft(window_samples))
+    freqs = np.fft.rfftfreq(len(window_samples), 1.0 / sr)
+    sb_mask = (freqs >= 300.0) & (freqs <= 3400.0)
+    if not np.any(sb_mask):
+        return False
+
+    sb_mag = fft_mag[sb_mask]
+    mean_val = float(np.mean(sb_mag) + 1e-9)
+    peak_val = float(np.max(sb_mag))
+    hfc = peak_val / mean_val
+    return hfc >= 5.0
+
+
+def detect_micro_bursts(
+    window_samples: np.ndarray,
+    sr: int = SR,
+    sub_sec: float = 0.5,
+    par_threshold: float = 2.0,
+) -> list[tuple[int, int]]:
+    """Detect high-kurtosis sub-intervals within a non-emitting macro window to spawn targeted 2.5s micro-windows.
+
+    Includes anti-impulse filtering (>=150ms duration) to avoid triggering on mic pops.
+    """
+    sub_len = int(sub_sec * sr)
+    n_subs = len(window_samples) // sub_len
+    if n_subs < 4:
+        return []
+
+    subs = window_samples[: n_subs * sub_len].reshape(n_subs, sub_len)
+    sub_rms = np.sqrt(np.mean(subs ** 2, axis=1) + 1e-12)
+
+    base_floor = float(np.median(sub_rms))
+    max_idx = int(np.argmax(sub_rms))
+    peak_val = sub_rms[max_idx]
+    par = peak_val / max(base_floor, 1e-6)
+
+    # Anti-impulse check: ensure adjacent sub-frame also has elevated energy (>= 1.35x baseline)
+    has_duration = False
+    if max_idx > 0 and sub_rms[max_idx - 1] >= base_floor * 1.35:
+        has_duration = True
+    elif max_idx < n_subs - 1 and sub_rms[max_idx + 1] >= base_floor * 1.35:
+        has_duration = True
+
+    micro_spans = []
+    if par >= par_threshold and has_duration:
+        center_sample = int((max_idx + 0.5) * sub_len)
+        half_micro = int(1.25 * sr)
+        micro_start = max(0, center_sample - half_micro)
+        micro_end = min(len(window_samples), micro_start + int(2.5 * sr))
+        if micro_end - micro_start >= int(2.0 * sr):
+            micro_spans.append((micro_start, micro_end))
+
+    return micro_spans
 
 
 class AcousticProfile:
