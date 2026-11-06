@@ -271,6 +271,100 @@ def merge_words_morphological(emitted: list[dict], new_words: list[dict]):
             emitted.append(nw)
 
 
+INCOMPLETE_CONTINUATIONS = {
+    "it's", "i'm", "we're", "they're", "you're", "he's", "she's", "that's", "what's", "there's",
+    "don't", "can't", "won't", "didn't", "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "and", "but", "or", "if", "when", "while", "because", "so", "to", "of", "in", "for", "with",
+    "at", "from", "into", "about", "like", "as", "than", "that", "which",
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her", "our", "their",
+    "i", "we", "you", "he", "she", "it", "they", "who", "whom", "whose", "what",
+}
+
+DISCOURSE_MARKERS = {
+    "oh", "well", "okay", "yeah", "yes", "right", "alright", "uh", "um", "ah", "like", "no",
+}
+
+
+def assemble_cohesive_sentences(
+    emitted_words: list[dict],
+    audio_signal: np.ndarray | None = None,
+    local_noise_floor: np.ndarray | None = None,
+    sr: int = audio.SR,
+) -> list[tuple[float, float, str]]:
+    """Synthesize full cohesive conversational sentences from word timestamps using syntactic and acoustic continuity."""
+    if not emitted_words:
+        return []
+
+    words = sorted(emitted_words, key=lambda w: w.get("global_start", 0.0))
+    sentences = []
+    curr_words = [words[0]]
+
+    for next_word in words[1:]:
+        prev_word_entry = curr_words[-1]
+        prev_text = prev_word_entry["word"].strip()
+        next_text = next_word["word"].strip()
+        gap = next_word["global_start"] - prev_word_entry["global_end"]
+
+        clean_prev = prev_text.rstrip(".,?!;:\"'").lower()
+        clean_next = next_text.lstrip(".,?!;:\"'").lower()
+        has_terminal_punct = prev_text.endswith((".", "!", "?"))
+
+        # Determine dynamic pause bridging threshold
+        max_bridge_gap = 0.65
+        if clean_prev in INCOMPLETE_CONTINUATIONS:
+            max_bridge_gap = 2.25
+        elif clean_prev in DISCOURSE_MARKERS or clean_next in DISCOURSE_MARKERS:
+            max_bridge_gap = 1.65
+        elif not has_terminal_punct:
+            max_bridge_gap = 1.10
+        else:
+            max_bridge_gap = 0.75
+
+        # Check acoustic continuity in the gap if signal is provided
+        is_acoustically_continuous = False
+        if 0.0 < gap <= max_bridge_gap and audio_signal is not None:
+            g_start_idx = int(prev_word_entry["global_end"] * sr)
+            g_end_idx = int(next_word["global_start"] * sr)
+            if g_end_idx > g_start_idx:
+                gap_slice = audio_signal[g_start_idx:g_end_idx]
+                gap_rms = float(np.sqrt(np.mean(gap_slice ** 2) + 1e-12))
+                
+                f_idx = min(len(local_noise_floor) - 1, int(prev_word_entry["global_end"] / 0.25)) if local_noise_floor is not None else 0
+                floor_rms = float(local_noise_floor[f_idx]) if local_noise_floor is not None else 0.005
+                if gap_rms >= floor_rms * 0.90:
+                    is_acoustically_continuous = True
+
+        should_bridge = False
+        if gap <= 0.0:
+            should_bridge = True
+        elif gap <= max_bridge_gap:
+            if clean_prev in INCOMPLETE_CONTINUATIONS:
+                should_bridge = True
+            elif clean_prev in DISCOURSE_MARKERS or clean_next in DISCOURSE_MARKERS:
+                should_bridge = True
+            elif not has_terminal_punct:
+                should_bridge = True
+            elif is_acoustically_continuous:
+                should_bridge = True
+
+        if should_bridge:
+            curr_words.append(next_word)
+        else:
+            s_text = " ".join(w["word"] for w in curr_words).strip()
+            if s_text:
+                sentences.append((round(curr_words[0]["global_start"], 2), round(curr_words[-1]["global_end"], 2), s_text))
+            curr_words = [next_word]
+
+    if curr_words:
+        s_text = " ".join(w["word"] for w in curr_words).strip()
+        if s_text:
+            sentences.append((round(curr_words[0]["global_start"], 2), round(curr_words[-1]["global_end"], 2), s_text))
+
+    return sentences
+
+
 def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None = None, progress_cb=None, model: str | None = None, threads: int | None = None) -> list[tuple[float, float, str]]:
     """Aggressive multi-model denoising, adaptive filtering, and formant scanning for sub-noise speech.
 
@@ -534,28 +628,10 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         print(f"[stt] Subnoise cascade: skipped {skipped_pregate}/{total_wins} non-vocal windows, "
               f"{fast_exits} fast-exited ({((skipped_pregate + fast_exits)/total_wins)*100:.1f}% CPU cycles saved)", file=sys.stderr)
 
-    # 4. Assembly into pause-delimited segments with precise audio timestamps
-    segments = []
-    if emitted_words:
-        curr_seg = [emitted_words[0]]
-        for w in emitted_words[1:]:
-            gap = w["global_start"] - curr_seg[-1]["global_end"]
-            prev_word = curr_seg[-1]["word"]
-            is_punct = prev_word.endswith((".", "!", "?"))
-            if gap > 0.65 or (is_punct and gap > 0.25):
-                seg_text = " ".join(x["word"] for x in curr_seg).strip()
-                if seg_text:
-                    segments.append((round(curr_seg[0]["global_start"], 2), round(curr_seg[-1]["global_end"], 2), seg_text))
-                curr_seg = [w]
-            else:
-                curr_seg.append(w)
-        if curr_seg:
-            seg_text = " ".join(x["word"] for x in curr_seg).strip()
-            if seg_text:
-                segments.append((round(curr_seg[0]["global_start"], 2), round(curr_seg[-1]["global_end"], 2), seg_text))
-
+    # 4. Assembly into cohesive conversational sentences with precise audio timestamps
+    segments = assemble_cohesive_sentences(emitted_words, hp, local_noise_floor)
     if segments:
-        print(f"[stt] Subnoise: assembled {len(segments)} pause-delimited segments from {len(emitted_words)} words", file=sys.stderr)
+        print(f"[stt] Subnoise: synthesized {len(segments)} cohesive sentences from {len(emitted_words)} words", file=sys.stderr)
         return segments
 
     # Fallback to window-level deduplication if word timestamps were unavailable

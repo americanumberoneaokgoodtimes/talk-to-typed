@@ -78,6 +78,8 @@ def _common(p):
                    help="interactive parameter wizard with educational guidance before running")
     p.add_argument("--window-size", type=float, help="sliding window length in seconds (subnoise mode)")
     p.add_argument("--step-size", type=float, help="sliding window stride in seconds (subnoise mode)")
+    p.add_argument("--dynamic", action="store_true",
+                   help="run multi-model ensemble (gtcrn, hybrid, dpdfnet4, hp) with confusion network ROVER fusion and cohesive sentence reconstitution")
     p.add_argument("--rumble-cutoff", type=float, help="high-pass filter cutoff in Hz (default 120)")
     p.add_argument("--formant-boost", type=float, help="formant equalization boost in dB (default 3.0)")
     p.add_argument("--blank-penalty", type=float, help="transducer blank penalty (0.0 to 1.5, default 0.6)")
@@ -371,7 +373,8 @@ def cmd_file(args, cfg):
             dur = len(samples) / audio.SR
             t = time.time()
 
-            if is_auto or getattr(args, "subnoise", False):
+            is_dynamic = getattr(args, "dynamic", False)
+            if is_auto or getattr(args, "subnoise", False) or is_dynamic:
                 auto_params = robust.auto_tune_settings(dur, samples=samples)
                 if getattr(args, "rumble_cutoff", None) is not None:
                     auto_params["low_hz"] = float(args.rumble_cutoff)
@@ -384,10 +387,15 @@ def cmd_file(args, cfg):
                 if getattr(args, "step_size", None) is not None:
                     auto_params["step_sec"] = float(args.step_size)
 
-                print(f"\n[stt auto-tune] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
-                print("[stt auto-tune] Deterministic Configuration Reasoning:", file=sys.stderr)
-                for reason in auto_params["reasoning"]:
-                    print(f"  • {reason}", file=sys.stderr)
+                if is_dynamic:
+                    print(f"\n[stt dynamic] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
+                    print("[stt dynamic] Multi-Model Dynamic Ensemble: gtcrn, hybrid, dpdfnet4, hp", file=sys.stderr)
+                    print("[stt dynamic] Hypotheses Fusion: Confusion Network ROVER + Cohesive Sentence Reconstitution", file=sys.stderr)
+                else:
+                    print(f"\n[stt auto-tune] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
+                    print("[stt auto-tune] Deterministic Configuration Reasoning:", file=sys.stderr)
+                    for reason in auto_params["reasoning"]:
+                        print(f"  • {reason}", file=sys.stderr)
 
                 progress_cb = make_progress_bar()
                 triples = robust.transcribe(
