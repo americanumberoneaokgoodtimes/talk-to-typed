@@ -27,6 +27,7 @@ file() {
   fi
 }
 tarball sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2                         # offline (stt file, --whisper, --distant)
+tarball sherpa-onnx-nemo-parakeet-tdt-1.1b-multilingual-int8.tar.bz2                # multilingual offline (ES, PT, EN + 25 more)
 tarball sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25.tar.bz2 # streaming (stt mic)
 file "$ASR" silero_vad.onnx                                                         # VAD
 file "$ENH" dpdfnet8.onnx                                                           # default denoiser for -a 2..5

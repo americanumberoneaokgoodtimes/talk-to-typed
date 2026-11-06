@@ -11,6 +11,7 @@
   - Streaming ASR: NeMo Nemotron 0.6B (160ms) / Banafo Kroko zipformer
   - VAD: Silero VAD int8
   - Speech Enhancement / Denoising: GTCRN (`gtcrn_simple.onnx`), DPDFNet (`dpdfnet8.onnx`, `dpdfnet4.onnx`, `dpdfnet2.onnx`)
+  - Offline Translation: Meta NLLB-200 distilled 600M via CTranslate2 INT8
 
 ## 2. Platform Detection & Directory Standards
 - Never overwrite Linux configurations when adding Windows support. Use dynamic platform dispatch:
@@ -25,6 +26,10 @@
   - Use bounded queues or reader threads to prevent pipe buffer deadlocks.
 
 ## 4. Noisy & Sub-Noise-Floor Speech Handling
-- Files with energy >85% in <100Hz rumble require high-pass filtering before feeding VAD/denoiser.
-- When speech is near or below noise floor, DPDFNet-8 alone can erase weak vocal formants.
-- Use multi-model denoising (`gtcrn` + `dpdfnet4` + high-pass) and sliding-window formant scanning (`--subnoise`) when standard VAD finds no speech.
+- **Pure-NumPy DSP**: No `scipy` or `torch` dependencies allowed in core DSP routines.
+- **Rumble Elimination**: Files with energy >85% in <120 Hz rumble require dynamic zero-phase Butterworth high-pass filtering (`butterworth_highpass`, 80 Hz–130 Hz) to avoid dynamic range saturation.
+- **Electrical Hum Notching**: Measure 50 Hz vs 60 Hz hum prominence via `profile_audio`; engage zero-phase harmonic notch rejection filters (`harmonic_notch_filter`) when prominence > 4.0x.
+- **Formant Lifting & Blank Penalty**: Speech near or below the noise floor requires formant band boosting (300 Hz–3200 Hz) and empirical SNR-scaled transducer blank penalty (0.30–1.05) to prevent silent `<blank>` token drops.
+- **Automatic Subfloor Escalation**: When standard VAD levels 0 through 5 detect no segments, the pipeline MUST automatically trigger subfloor formant recovery scanning (`subnoise_transcribe`) instead of abandoning the file.
+- **Parallel Stream Decoding**: Multi-model enhancement candidates (`gtcrn`, `dpdfnet4`, `hpf`) MUST be parallelized using `asr.transcribe_batch` via `rec.decode_streams()` to leverage native multithreading.
+- **Timeline Timestamping**: All transcribed segments MUST preserve and display audio timeline intervals `[MM:SS.mmm -> MM:SS.mmm]` for verifiable manual auditing.

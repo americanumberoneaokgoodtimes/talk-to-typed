@@ -82,11 +82,33 @@ def _common(p):
     p.add_argument("--formant-boost", type=float, help="formant equalization boost in dB (default 3.0)")
     p.add_argument("--blank-penalty", type=float, help="transducer blank penalty (0.0 to 1.5, default 0.6)")
     p.add_argument("--lang", help="language hint; ignored by models that auto-detect or are English-only")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="disable progressive fallback to higher aggressiveness levels when no speech is found")
+    p.add_argument("-t", "--timestamps", action=argparse.BooleanOptionalAction, default=True,
+                   help="display timestamps for each transcribed speech segment (default: true; disable with --no-timestamps)")
+    # Multilingual & Translation
+    p.add_argument("--lang-source", choices=["auto", "en", "es", "pt"], default=None,
+                   help="source language: auto (detect), en, es, pt")
+    p.add_argument("--lang-target", choices=["en", "es", "pt"], default=None,
+                   help="target language for translation: en, es, pt")
+    p.add_argument("--translate", action="store_true",
+                   help="enable translation from source to target language")
 
 
 def _lang_note(args):
     if args.lang:
         print(f"note: --lang {args.lang} ignored (selected models auto-detect / are English-only)", file=sys.stderr)
+
+
+def format_timestamp(seconds: float) -> str:
+    """Format seconds into HH:MM:SS.mmm or MM:SS.mmm for timeline displays."""
+    millis = int(round(seconds * 1000))
+    hours, remainder = divmod(millis, 3600000)
+    minutes, remainder = divmod(remainder, 60000)
+    secs, ms = divmod(remainder, 1000)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    return f"{minutes:02d}:{secs:02d}.{ms:03d}"
 
 
 def format_timestamp_srt(seconds: float) -> str:
@@ -105,18 +127,52 @@ def format_timestamp_vtt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
 
 
-def format_srt(triples: list[tuple[float, float, str]]) -> str:
+def _is_bilingual(triples):
+    """Check if triples contain bilingual data (4-tuples)."""
+    return triples and len(triples[0]) == 4
+
+
+def format_srt(triples: list[tuple]) -> str:
+    """Format as SRT. Supports both 3-tuple (start, end, text) and 4-tuple (start, end, source, target)."""
     blocks = []
-    for idx, (s, e, text) in enumerate(triples, 1):
+    bilingual = _is_bilingual(triples)
+    for idx, item in enumerate(triples, 1):
+        if bilingual:
+            s, e, src, tgt = item
+            text = f"{src}\n{tgt}" if tgt else src
+        else:
+            s, e, text = item
         blocks.append(f"{idx}\n{format_timestamp_srt(s)} --> {format_timestamp_srt(e)}\n{text}\n")
     return "\n".join(blocks)
 
 
-def format_vtt(triples: list[tuple[float, float, str]]) -> str:
+def format_vtt(triples: list[tuple]) -> str:
+    """Format as VTT. Supports both 3-tuple and 4-tuple."""
     blocks = ["WEBVTT\n"]
-    for idx, (s, e, text) in enumerate(triples, 1):
+    bilingual = _is_bilingual(triples)
+    for idx, item in enumerate(triples, 1):
+        if bilingual:
+            s, e, src, tgt = item
+            text = f"{src}\n{tgt}" if tgt else src
+        else:
+            s, e, text = item
         blocks.append(f"{idx}\n{format_timestamp_vtt(s)} --> {format_timestamp_vtt(e)}\n{text}\n")
     return "\n".join(blocks)
+
+
+def format_jsonl(triples: list[tuple], file: str = "") -> str:
+    """Format as JSONL. Supports both 3-tuple and 4-tuple."""
+    lines = []
+    bilingual = _is_bilingual(triples)
+    for item in triples:
+        if bilingual:
+            s, e, src, tgt = item
+            obj = {"file": file, "start": round(s, 2), "end": round(e, 2), "text": src, "translated": tgt}
+        else:
+            s, e, text = item
+            obj = {"file": file, "start": round(s, 2), "end": round(e, 2), "text": text}
+        lines.append(json.dumps(obj, ensure_ascii=False))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def make_progress_bar():
@@ -277,9 +333,22 @@ def cmd_file(args, cfg):
     bp = getattr(args, "blank_penalty", None)
     if bp is None:
         bp = cfg.get("blank_penalty")
+    
+    # Multilingual & Translation args
+    lang_source = getattr(args, "lang_source", None) or cfg.get("source_language", "auto")
+    lang_target = getattr(args, "lang_target", None) or cfg.get("target_language", "en")
+    do_translate = getattr(args, "translate", False) or cfg.get("translation_enabled", False)
+    use_multilingual = do_translate or (lang_source not in ("auto", "en"))
+    
     if not args.jsonl:
         print("[stt] Loading model...", file=sys.stderr, flush=True)
-    rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
+    
+    if use_multilingual:
+        # Load multilingual model for translation or non-English source
+        rec = asr.get_multilingual_offline(cfg, args.model, args.threads, blank_penalty=bp)
+    else:
+        rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
+    
     if not args.jsonl:
         print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     out = open(args.out, "w") if args.out else sys.stdout
@@ -296,12 +365,14 @@ def cmd_file(args, cfg):
             except RuntimeError as e:
                 print(f"error: {e}", file=sys.stderr)
                 continue
+            if samples is None:
+                continue
 
             dur = len(samples) / audio.SR
             t = time.time()
 
             if is_auto or getattr(args, "subnoise", False):
-                auto_params = robust.auto_tune_settings(dur)
+                auto_params = robust.auto_tune_settings(dur, samples=samples)
                 if getattr(args, "rumble_cutoff", None) is not None:
                     auto_params["low_hz"] = float(args.rumble_cutoff)
                 if getattr(args, "formant_boost", None) is not None:
@@ -327,7 +398,33 @@ def cmd_file(args, cfg):
                 sys.stderr.write("\r\033[K")
                 sys.stderr.flush()
             else:
-                triples = robust.transcribe(rec, samples, cfg, level, subnoise=False)
+                # Standard transcription
+                total_chunks = max(1, len(samples) // (30 * audio.SR))
+                print(f"[stt file] Processing {dur:.0f}s audio (~{total_chunks} chunks)...", file=sys.stderr)
+                
+                chunk_progress = [0]
+                def progress_report():
+                    chunk_progress[0] += 1
+                    pct = min(100, int(chunk_progress[0] / max(total_chunks, 1) * 100))
+                    bar = "=" * (pct // 5) + ">" + " " * (20 - pct // 5 - 1)
+                    sys.stderr.write(f"\r[stt] [{bar}] {pct:3d}% | Chunk {chunk_progress[0]}/{total_chunks}")
+                    sys.stderr.flush()
+                
+                no_fallback = getattr(args, "no_fallback", False)
+                
+                if use_multilingual and (do_translate or lang_source != "en"):
+                    # Multilingual transcription with optional translation
+                    triples = robust.transcribe_multilingual(
+                        rec, samples, cfg,
+                        source_lang=lang_source,
+                        target_lang=lang_target if do_translate else None,
+                        translate=do_translate,
+                        level=level,
+                        progress_cb=progress_report if not no_fallback else None,
+                    )
+                else:
+                    # Standard English-only transcription
+                    triples = robust.transcribe(rec, samples, cfg, level, subnoise=False, no_fallback=no_fallback)
 
             dt = time.time() - t
             total_audio += dur
@@ -335,6 +432,7 @@ def cmd_file(args, cfg):
             if args.verbose:
                 print(f"{path}: {dur:.1f}s audio, {dt:.2f}s processing, RTF {dt / max(dur, 1e-9):.3f}", file=sys.stderr)
 
+            # Sidecar files
             if getattr(args, "sidecar", False):
                 p_obj = Path(path)
                 if getattr(args, "srt", False):
@@ -345,14 +443,26 @@ def cmd_file(args, cfg):
                     sidecar_path.write_text(format_vtt(triples), encoding="utf-8")
                 elif getattr(args, "jsonl", False):
                     sidecar_path = p_obj.with_suffix(".jsonl")
-                    jlines = [json.dumps({"file": path, "start": round(s, 2), "end": round(e, 2), "text": text}, ensure_ascii=False) for s, e, text in triples]
-                    sidecar_path.write_text("\n".join(jlines) + "\n", encoding="utf-8")
+                    sidecar_path.write_text(format_jsonl(triples, path), encoding="utf-8")
                 else:
                     sidecar_path = p_obj.with_suffix(".txt")
-                    sidecar_path.write_text(" ".join(t for _, _, t in triples) + "\n", encoding="utf-8")
+                    show_ts = getattr(args, "timestamps", True)
+                    if show_ts:
+                        if triples and len(triples[0]) == 4:
+                            lines = [f"[{format_timestamp(s)} -> {format_timestamp(e)}] {src} / {tgt}" if tgt else f"[{format_timestamp(s)} -> {format_timestamp(e)}] {src}" for s, e, src, tgt in triples]
+                        else:
+                            lines = [f"[{format_timestamp(s)} -> {format_timestamp(e)}] {t}" for s, e, t in triples]
+                        sidecar_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    else:
+                        if triples and len(triples[0]) == 4:
+                            lines = [f"{src} / {tgt}" if tgt else src for _, _, src, tgt in triples]
+                        else:
+                            lines = [t for _, _, t in triples]
+                        sidecar_path.write_text(" ".join(lines) + "\n", encoding="utf-8")
                 if args.verbose:
                     print(f"[stt] saved sidecar: {sidecar_path}", file=sys.stderr)
 
+            # Main output
             if getattr(args, "srt", False):
                 if total_files > 1 and not args.out:
                     out.write(f"== {path}\n")
@@ -362,14 +472,26 @@ def cmd_file(args, cfg):
                     out.write(f"== {path}\n")
                 out.write(format_vtt(triples))
             elif getattr(args, "jsonl", False):
-                for s, e, text in triples:
-                    out.write(json.dumps({"file": path, "start": round(s, 2), "end": round(e, 2), "text": text}, ensure_ascii=False) + "\n")
+                out.write(format_jsonl(triples, path))
             else:
-                lines = [t for _, _, t in triples]
                 if total_files > 1:
                     out.write(f"== {path}\n")
-                if lines:
-                    out.write(" ".join(lines) + "\n")
+                show_ts = getattr(args, "timestamps", True)
+                if show_ts:
+                    if triples and len(triples[0]) == 4:
+                        lines = [f"[{format_timestamp(s)} -> {format_timestamp(e)}] {src} / {tgt}" if tgt else f"[{format_timestamp(s)} -> {format_timestamp(e)}] {src}" for s, e, src, tgt in triples]
+                    else:
+                        lines = [f"[{format_timestamp(s)} -> {format_timestamp(e)}] {t}" for s, e, t in triples]
+                    if lines:
+                        out.write("\n".join(lines) + "\n")
+                else:
+                    # For bilingual, include both source and translation
+                    if triples and len(triples[0]) == 4:
+                        lines = [f"{src} / {tgt}" if tgt else src for _, _, src, tgt in triples]
+                    else:
+                        lines = [t for _, _, t in triples]
+                    if lines:
+                        out.write(" ".join(lines) + "\n")
         out.flush()
     finally:
         if args.out:
@@ -447,6 +569,10 @@ def cmd_mic(args, cfg):
     def emit(text, start, end):
         if args.jsonl:
             print(json.dumps({"start": round(start - t0, 2), "end": round(end - t0, 2), "text": text}, ensure_ascii=False), flush=True)
+        elif getattr(args, "timestamps", True):
+            s_rel = max(0.0, start - t0)
+            e_rel = max(0.0, end - t0)
+            print(f"[{format_timestamp(s_rel)} -> {format_timestamp(e_rel)}] {text}", flush=True)
         else:
             print(text, flush=True)
 

@@ -588,6 +588,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </select>
     </div>
 
+    <div class="section-title">Language & Translation</div>
+    <div class="control-group">
+      <label for="langSource">Source Language</label>
+      <select id="langSource">
+        <option value="auto" selected>Auto-detect</option>
+        <option value="en">English</option>
+        <option value="es">Spanish</option>
+        <option value="pt">Portuguese</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label for="langTarget">Target Language <span class="label-desc">(for translation)</span></label>
+      <select id="langTarget">
+        <option value="en" selected>English</option>
+        <option value="es">Spanish</option>
+        <option value="pt">Portuguese</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label class="checkbox-row">
+        <input type="checkbox" id="enableTranslation">
+        <span>Enable Translation</span>
+      </label>
+    </div>
+    <div class="control-group" id="langDetectInfo" style="display: none;">
+      <label>Detected Language</label>
+      <div id="detectedLangBadge" style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; font-size: 0.85rem;">
+        <span class="label-desc" id="detectedLangText">Detecting...</span>
+        <span class="val-badge" id="detectedLangConf"></span>
+      </div>
+    </div>
+
     <div class="section-title">Acoustic Equalization</div>
     <div class="control-group">
       <label for="rumbleCutoff">Low-Cut Rumble Filter <span class="val-badge" id="valRumble">120 Hz</span></label>
@@ -1024,8 +1056,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
       step_size: parseFloat(document.getElementById('stepSize').value),
       threads: parseInt(document.getElementById('threads').value),
       recursive: document.getElementById('recursive').checked,
-      server_path: pathVal || null
+      server_path: pathVal || null,
+      // Multilingual & Translation
+      source_lang: document.getElementById('langSource').value,
+      target_lang: document.getElementById('langTarget').value,
+      translate: document.getElementById('enableTranslation').checked,
     };
+
+    // Show/hide language detection info
+    const langDetectInfo = document.getElementById('langDetectInfo');
+    if (payload.source_lang === 'auto') {
+      langDetectInfo.style.display = 'block';
+      document.getElementById('detectedLangText').textContent = 'Detecting...';
+      document.getElementById('detectedLangConf').textContent = '';
+    } else {
+      langDetectInfo.style.display = 'none';
+    }
 
     reasoningBox.style.display = 'none';
     errorBanner.style.display = 'none';
@@ -1136,12 +1182,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
               progFile.textContent = data.file || "Processing";
               progTime.textContent = `${data.cur_time} / ${data.tot_time}`;
               progSpeed.textContent = `Speed: ${data.rtf}x | ETA: ${data.eta}`;
+            } else if (eventType === "language_detected") {
+              // Update language detection display
+              const langDetectInfo = document.getElementById('langDetectInfo');
+              langDetectInfo.style.display = 'block';
+              document.getElementById('detectedLangText').textContent = `Detected: ${data.lang.toUpperCase()}`;
+              document.getElementById('detectedLangConf').textContent = `${(data.confidence * 100).toFixed(0)}%`;
             } else if (eventType === "segment") {
               segmentsHistory.push(data);
+              const isBilingual = data.translated !== undefined && data.translated !== null;
+              
+              // Build display text
+              let displayText = data.text;
+              if (isBilingual && data.translated) {
+                displayText = `${data.text} / ${data.translated}`;
+              }
+              
               if (output.value && !output.value.endsWith("\n") && !output.value.endsWith(" ")) {
                 output.value += " ";
               }
-              output.value += data.text;
+              output.value += displayText;
               output.scrollTop = output.scrollHeight;
 
               // Append interactive cue item
@@ -1149,7 +1209,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
               segEl.className = 'segment-item';
               segEl.dataset.start = data.start;
               segEl.dataset.end = data.end;
-              segEl.innerHTML = `<span class="seg-time">${formatSec(data.start)} → ${formatSec(data.end)}</span><span class="seg-text">${escapeHtml(data.text)}</span>`;
+              
+              let segHtml = `<span class="seg-time">${formatSec(data.start)} → ${formatSec(data.end)}</span>`;
+              if (isBilingual && data.translated) {
+                segHtml += `<span class="seg-text">${escapeHtml(data.text)}</span><span class="seg-text" style="color: var(--text-muted); font-size: 0.85rem;"> → ${escapeHtml(data.translated)}</span>`;
+              } else {
+                segHtml += `<span class="seg-text">${escapeHtml(data.text)}</span>`;
+              }
+              if (data.lang) {
+                segHtml += `<span class="seg-time" style="color: var(--accent); font-size: 0.7rem;">[${data.lang.toUpperCase()}]</span>`;
+              }
+              segEl.innerHTML = segHtml;
               segEl.onclick = () => {
                 audioPlayer.currentTime = data.start;
                 audioPlayer.play();
@@ -1585,7 +1655,17 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             cfg = self.server.cfg
             threads = req.get("threads") or cfg.get("threads", 4)
             blank_penalty = req.get("blank_penalty") or cfg.get("blank_penalty")
-            rec = asr.get_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
+            
+            # Check if multilingual/translation is requested
+            source_lang = req.get("source_lang", "auto")
+            target_lang = req.get("target_lang", "en")
+            do_translate = req.get("translate", False)
+            use_multilingual = do_translate or (source_lang not in ("auto", "en"))
+            
+            if use_multilingual:
+                rec = asr.get_multilingual_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
+            else:
+                rec = asr.get_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
         except Exception as e:
             send_sse("error", {"message": f"Failed to load ASR model: {e}"})
             return
@@ -1655,14 +1735,42 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     )
                 else:
                     level = 3 if strategy == "robust" else (5 if strategy == "distant" else 0)
-                    triples = robust.transcribe(rec, samples, cfg, level=level, subnoise=False)
+                    
+                    if use_multilingual:
+                        # Multilingual transcription with optional translation
+                        triples = robust.transcribe_multilingual(
+                            rec, samples, cfg,
+                            source_lang=source_lang,
+                            target_lang=target_lang if do_translate else None,
+                            translate=do_translate,
+                            level=level,
+                            progress_cb=None,  # Could add progress callback here
+                        )
+                        
+                        # Send language detected event if auto-detect was used
+                        if source_lang == "auto" and triples:
+                            # Get detected language from first segment
+                            detected = triples[0][3] if len(triples[0]) == 4 and triples[0][3] else None
+                            if not detected and triples:
+                                # Try to detect from first segment text
+                                from . import asr
+                                detected, conf = asr.detect_language_from_audio(rec, samples[:min(int(cfg.get("lang_detect_min_duration", 2.0)) * audio.SR, len(samples))])
+                                send_sse("language_detected", {"lang": detected, "confidence": conf})
+                    else:
+                        triples = robust.transcribe(rec, samples, cfg, level=level, subnoise=False)
             except Exception as e:
                 send_sse("segment", {"file": disp_name, "start": 0, "end": 0,
                                      "text": f"[Error transcribing {disp_name}: {e}]"})
                 continue
 
-            for s, e, text in triples:
-                send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": text})
+            # Send segments - handle both regular (3-tuple) and bilingual (4-tuple)
+            for item in triples:
+                if len(item) == 4:
+                    s, e, src, tgt = item
+                    send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": src, "translated": tgt, "lang": source_lang if source_lang != "auto" else "auto"})
+                else:
+                    s, e, text = item
+                    send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": text})
 
         dt = time.time() - t0_total
         send_sse("done", {

@@ -29,7 +29,7 @@ def _files(d: Path) -> dict:
 
 
 def _model_type(d: Path) -> str:
-    """NeMo/Nemotron exports need model_type nemo_transducer; plain zipformer transducers (e.g. kroko) use the default.
+    """NeMo/Nemotron exports need model_type nemo_transducer; plain zipformer (e.g., kroko) use default.
     
     Detection is based on directory name convention from sherpa-onnx releases.
     NeMo models have 'nemo' in their release name (e.g., sherpa-onnx-nemo-parakeet-*, sherpa-onnx-nemotron-*).
@@ -68,15 +68,119 @@ def streaming(cfg: dict, model: str | None = None, threads: int | None = None):
 
 
 def transcribe(rec, chunks: list[np.ndarray]) -> list[str]:
-    """Batch-decode a list of 16 kHz float32 arrays with an offline recognizer."""
-    streams = []
+    """Decode a list of 16 kHz float32 arrays with an offline recognizer (process each chunk individually)."""
+    texts = []
     for c in chunks:
         s = rec.create_stream()
         s.accept_waveform(SR, c)
-        streams.append(s)
-    if streams:
-        rec.decode_streams(streams)
-    return [s.result.text.strip() for s in streams]
+        rec.decode_stream(s)  # Process each stream individually to avoid OOM
+        texts.append(s.result.text.strip())
+    return texts
+
+
+def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> list[str]:
+    """Batch-decode a small list of candidate audio chunks in parallel using decode_streams."""
+    if not chunks:
+        return []
+    texts = []
+    for i in range(0, len(chunks), max_batch_size):
+        batch = chunks[i : i + max_batch_size]
+        streams = []
+        for c in batch:
+            s = rec.create_stream()
+            s.accept_waveform(SR, c)
+            streams.append(s)
+        try:
+            rec.decode_streams(streams)
+            for s in streams:
+                texts.append(s.result.text.strip())
+        except Exception:
+            # Fallback to single decode if batch decode is unsupported or fails
+            for s in streams:
+                try:
+                    rec.decode_stream(s)
+                    texts.append(s.result.text.strip())
+                except Exception:
+                    texts.append("")
+    return texts
+
+
+# Multilingual support
+_multilingual_offline_cache: dict = {}
+_multilingual_offline_cache_lock = threading.Lock()
+
+
+def get_multilingual_offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
+    """Get or create a multilingual offline recognizer.
+    
+    Multilingual models (like Parakeet TDT 1.1B or Parakeet TDT 0.6B) support multiple languages
+    and can auto-detect the spoken language.
+    """
+    name = model or cfg.get("multilingual_model")
+    try:
+        d = _resolve(cfg, name, "multilingual_model")
+    except (FileNotFoundError, ValueError):
+        name = model or cfg.get("offline_model")
+        d = _resolve(cfg, name, "offline_model")
+    
+    bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
+    key = (name, threads or cfg.get("threads", 4), bp_key)
+    
+    with _multilingual_offline_cache_lock:
+        if key not in _multilingual_offline_cache:
+            kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
+            if blank_penalty is not None:
+                kwargs["blank_penalty"] = float(blank_penalty)
+            _multilingual_offline_cache[key] = sherpa_onnx.OfflineRecognizer.from_transducer(
+                **_files(d), **kwargs
+            )
+        return _multilingual_offline_cache[key]
+
+
+def detect_language_from_audio(rec, samples: np.ndarray, min_duration: float = 2.0) -> tuple[str, float]:
+    """Detect language from audio using the multilingual model.
+    
+    Returns (language_code, confidence)
+    
+    Note: This is a simple heuristic - runs recognition on first min_duration
+    seconds and uses text-based language detection.
+    """
+    from . import translation
+    
+    if len(samples) == 0:
+        return "en", 0.0
+    
+    # Use first min_duration seconds for detection
+    detect_samples = int(min_duration * SR)
+    chunk = samples[:min(detect_samples, len(samples))]
+    
+    # Transcribe
+    texts = transcribe(rec, [chunk])
+    text = texts[0] if texts else ""
+    
+    # Use text-based detection
+    if text:
+        return translation.detect_language_simple(text)
+    return "en", 0.0
+
+
+def transcribe_multilingual(rec, chunks: list[np.ndarray]) -> list[tuple[str, str]]:
+    """Transcribe with language detection per chunk.
+    
+    Returns list of (text, detected_language) tuples.
+    """
+    results = []
+    for c in chunks:
+        s = rec.create_stream()
+        s.accept_waveform(SR, c)
+        rec.decode_stream(s)
+        text = s.result.text.strip()
+        
+        # Detect language from the transcribed text
+        lang, conf = detect_language_from_audio(rec, c, min_duration=0.5)
+        results.append((text, lang))
+    
+    return results
 
 
 DENOISER_PREFIXES = ("gtcrn", "dpdfnet")

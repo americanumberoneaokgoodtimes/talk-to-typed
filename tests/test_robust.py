@@ -86,3 +86,43 @@ def test_variants():
         for variant in v:
             assert "denoise" in variant
             assert "vad" in variant
+
+
+def test_auto_tune_settings_adaptive_samples():
+    sr = 16000
+    t = np.linspace(0, 10.0, sr * 10, endpoint=False)
+    # Heavy rumble + weak noise
+    sig = 0.4 * np.sin(2 * np.pi * 35 * t).astype(np.float32)
+    sig += np.random.normal(0, 0.01, len(t)).astype(np.float32)
+
+    tuned = robust.auto_tune_settings(10.0, samples=sig)
+    assert "snr_db" in tuned
+    assert "pregate_threshold" in tuned
+    assert tuned["low_hz"] >= 120.0
+    assert len(tuned["reasoning"]) > 0
+
+
+def test_score_coherence_natural_repetition():
+    # Spanish natural sentence containing 'no' 3 times
+    spanish_phrase = "No, no tengo nada, no"
+    score, reason = robust.score_coherence(spanish_phrase, 3.0)
+    assert score > 0.5
+    assert reason == "coherent"
+
+    # Degenerate loop should still be suppressed
+    loop_phrase = "no no no no no"
+    score_loop, reason_loop = robust.score_coherence(loop_phrase, 3.0)
+    assert score_loop <= 0.05
+    assert "repetitive token" in reason_loop
+
+
+def test_subnoise_transcribe_deduplication():
+    # Test deduplication logic directly with mock recognizer
+    from unittest.mock import MagicMock
+    mock_rec = MagicMock()
+    mock_rec.create_stream.return_value = MagicMock()
+
+    # Empty samples returns empty
+    cfg = dict(config.DEFAULTS)
+    res_empty = robust.subnoise_transcribe(mock_rec, np.array([], dtype=np.float32), cfg)
+    assert res_empty == []

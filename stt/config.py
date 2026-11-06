@@ -51,6 +51,14 @@ DEFAULTS = {
     "termux_tmp": "/data/data/com.termux/files/home/.cache/stt",
     "windows_mic_device": "default",
     "windows_backend": "auto",
+    # Multilingual & Translation
+    "multilingual_model": "sherpa-onnx-nemo-parakeet-tdt-1.1b-multilingual-int8",
+    "translation_enabled": False,
+    "translation_model": "nllb-200-distilled-600M",
+    "source_language": "auto",           # auto, en, es, pt
+    "target_language": "en",             # en, es, pt
+    "lang_detect_min_duration": 2.0,     # seconds for reliable language detection
+    "lang_detect_confidence_threshold": 0.7,
 }
 
 TEMPLATE = """# stt configuration (created on first run; edit freely)
@@ -90,12 +98,21 @@ termux_tmp = '{termux_tmp}'             # must be a path the Termux:API app can 
 # Windows mic configuration
 windows_mic_device = '{windows_mic_device}'  # audio device name or "default" (DirectShow/WASAPI)
 windows_backend = '{windows_backend}'        # auto | dshow | sounddevice
+# Multilingual & Translation
+multilingual_model = '{multilingual_model}'     # sherpa-onnx multilingual model (e.g. parakeet 1.1b)
+translation_enabled = {translation_enabled_toml}  # enable translation pipeline
+translation_model = '{translation_model}'       # CTranslate2 NLLB model name
+source_language = '{source_language}'           # auto, en, es, pt
+target_language = '{target_language}'           # en, es, pt
+lang_detect_min_duration = {lang_detect_min_duration}  # min seconds for language detection
+lang_detect_confidence_threshold = {lang_detect_confidence_threshold}  # confidence threshold 0-1
 """
 
 
 # Boolean config keys that should be normalized from string "true"/"false"
 _BOOL_KEYS = {
     "mic_agc",
+    "translation_enabled",
 }
 
 def _normalize_bool_config(cfg: dict) -> dict:
@@ -112,7 +129,11 @@ def load() -> dict:
     cfg = dict(DEFAULTS)
     if not CONFIG_PATH.exists():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(TEMPLATE.format(**DEFAULTS, mic_agc_toml=str(DEFAULTS['mic_agc']).lower()))
+        CONFIG_PATH.write_text(TEMPLATE.format(
+            **DEFAULTS,
+            mic_agc_toml=str(DEFAULTS['mic_agc']).lower(),
+            translation_enabled_toml=str(DEFAULTS['translation_enabled']).lower(),
+        ))
     else:
         with open(CONFIG_PATH, "rb") as f:
             cfg.update(tomllib.load(f))
@@ -140,7 +161,11 @@ def update_config(updates: dict) -> None:
         # First-time write: use the full commented template
         cfg = dict(DEFAULTS)
         cfg.update(updates)
-        CONFIG_PATH.write_text(TEMPLATE.format(**cfg, mic_agc_toml=str(cfg['mic_agc']).lower()))
+        CONFIG_PATH.write_text(TEMPLATE.format(
+            **cfg,
+            mic_agc_toml=str(cfg['mic_agc']).lower(),
+            translation_enabled_toml=str(cfg['translation_enabled']).lower(),
+        ))
         return
 
     remaining = dict(updates)

@@ -6,6 +6,13 @@ import pytest
 from stt import cli
 
 
+def test_format_timestamp():
+    assert cli.format_timestamp(0.0) == "00:00.000"
+    assert cli.format_timestamp(1.234) == "00:01.234"
+    assert cli.format_timestamp(65.5) == "01:05.500"
+    assert cli.format_timestamp(3661.123) == "01:01:01.123"
+
+
 def test_format_timestamp_srt():
     assert cli.format_timestamp_srt(0.0) == "00:00:00,000"
     assert cli.format_timestamp_srt(1.234) == "00:00:01,234"
