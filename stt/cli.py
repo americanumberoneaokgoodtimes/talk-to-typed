@@ -185,6 +185,8 @@ def _add_shared_groups(p, is_file: bool = True):
     g_dsp.add_argument("--dynamic", action="store_true",
                        help="run 4-model ensemble (gtcrn, hybrid, dpdfnet4, hp) with CN-ROVER fusion and cohesive sentence reconstitution")
     if is_file:
+        g_dsp.add_argument("--all", action="store_true",
+                           help="run audio through ALL model combinations, enhancements, and parameters with color-coded comparative output")
         g_dsp.add_argument("--subnoise", action="store_true",
                            help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
     g_dsp.add_argument("--auto", action="store_true",
@@ -476,17 +478,21 @@ def cmd_file(args, cfg):
     do_translate = getattr(args, "translate", False) or cfg.get("translation_enabled", False)
     use_multilingual = do_translate or (lang_source not in ("auto", "en"))
     
-    if not args.jsonl:
-        print("[stt] Loading model...", file=sys.stderr, flush=True)
-    
-    if use_multilingual:
-        # Load multilingual model for translation or non-English source
-        rec = asr.get_multilingual_offline(cfg, args.model, args.threads, blank_penalty=bp)
+    is_all = getattr(args, "all", False)
+    if not is_all:
+        if not args.jsonl:
+            print("[stt] Loading model...", file=sys.stderr, flush=True)
+        
+        if use_multilingual:
+            # Load multilingual model for translation or non-English source
+            rec = asr.get_multilingual_offline(cfg, args.model, args.threads, blank_penalty=bp)
+        else:
+            rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
+        
+        if not args.jsonl:
+            print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     else:
-        rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
-    
-    if not args.jsonl:
-        print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
+        rec = None
     out = open(args.out, "w") if args.out else sys.stdout
     total_audio = total_proc = 0.0
     total_files = len(resolved_paths)
@@ -506,6 +512,13 @@ def cmd_file(args, cfg):
 
             dur = len(samples) / audio.SR
             t = time.time()
+
+            if is_all:
+                from . import matrix
+                matrix.run_matrix(samples, cfg, audio_path=path, threads=args.threads)
+                total_audio += dur
+                total_proc += time.time() - t
+                continue
 
             is_dynamic = getattr(args, "dynamic", False)
             if is_auto or getattr(args, "subnoise", False) or is_dynamic:
@@ -850,6 +863,9 @@ def main(argv=None):
   stt file recording.wav --dynamic
       Run multi-model dynamic ensemble for faint, distant, or noisy speech.
 
+  stt file recording.wav --all
+      Run through ALL installed models & DSP enhancements with color-coded comparison.
+
   stt file video.mp4 --srt --sidecar
       Generate video.srt subtitles alongside the video file.
 
@@ -882,6 +898,11 @@ def main(argv=None):
   stt file audio.wav --dynamic
       4-model multi-stream ensemble (gtcrn, hybrid, dpdfnet4, hp) with CN-ROVER
       fusion and cohesive sentence reconstitution for low-energy speech.
+
+  stt file audio.wav --all
+      Run audio through ALL models (offline & streaming), enhancement filters
+      (GTCRN, DPDFNet, hybrid crossover, formant EQ), and parameter permutations
+      with color-coded side-by-side terminal output and summary matrix.
 
   stt file video.mp4 --srt --sidecar
       Create SubRip subtitle file (video.srt) directly beside input media.
