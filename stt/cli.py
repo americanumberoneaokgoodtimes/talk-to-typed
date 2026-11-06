@@ -2,6 +2,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -9,6 +10,122 @@ import time
 from pathlib import Path
 
 from . import __version__, config, robust
+
+if sys.platform == "win32":
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+
+def _color_enabled() -> bool:
+    """Check if ANSI color output should be enabled based on environment and TTY status."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+class ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """High-contrast ANSI color help formatter with clean columns and syntax highlighting."""
+
+    def __init__(self, prog, indent_increment=2, max_help_position=30, width=105):
+        super().__init__(prog, indent_increment=indent_increment, max_help_position=max_help_position, width=width)
+        self.use_color = _color_enabled()
+
+    def format_help(self):
+        help_text = super().format_help()
+        if not self.use_color:
+            return help_text
+        return self._colorize(help_text)
+
+    def _colorize(self, text: str) -> str:
+        lines = []
+        in_examples = False
+        for line in text.splitlines():
+            # Suppress bare subparser placeholder lines like "  {file,mic,ui,doctor,config}"
+            if re.match(r"^\s*\{[a-z0-9_,\-]+\}\s*$", line):
+                continue
+
+            # Section: EXAMPLES / SYNTAX / EXAMPLES & USAGE
+            if re.match(r"^(EXAMPLES|SYNTAX|EXAMPLES & USAGE):", line.strip(), re.IGNORECASE):
+                in_examples = True
+                lines.append(f"\033[1;33m{line}\033[0m")
+                continue
+
+            if in_examples:
+                if re.match(r"^\s+stt\b", line):
+                    # Command invocation: highlight command in bold green, flags in cyan
+                    cmd_line = re.sub(r"(-{1,2}[a-zA-Z0-9_\-]+)", r"\033[1;36m\1\033[0m", line)
+                    cmd_line = re.sub(r"(\bstt(?:\s+[a-z]+)?\b)", r"\033[1;32m\1\033[0m", cmd_line)
+                    lines.append(cmd_line)
+                elif line.strip().startswith("#"):
+                    lines.append(f"\033[90m{line}\033[0m")
+                else:
+                    lines.append(line)
+                continue
+
+            # 1. Usage line
+            if re.match(r"^usage:", line, re.IGNORECASE):
+                line = re.sub(r"^usage:", "\033[1;32mUSAGE:\033[0m", line, flags=re.IGNORECASE)
+                line = re.sub(r"(\bstt(?:\s+[a-z]+)?\b)", r"\033[1;37m\1\033[0m", line)
+                lines.append(line)
+                continue
+
+            # 2. Section Headings (e.g., 'POSITIONAL ARGUMENTS:', 'OPTIONS:', etc.)
+            clean_strip = line.strip()
+            if re.match(r"^[A-Z0-9 &_\-\/]+:$", clean_strip) or clean_strip.lower() in ("options:", "positional arguments:", "subcommands:"):
+                lines.append(f"\033[1;36m{clean_strip.upper()}\033[0m")
+                continue
+
+            # 3. Option definitions: lines starting with indentation and flags
+            if line.startswith("  -"):
+                m = re.match(r"^(\s{2,})(.*?)(\s{2,}\S.*)$", line)
+                if m:
+                    indent, inv, desc = m.groups()
+                    c_inv = self._colorize_invocation(inv)
+                    c_desc = re.sub(r"(\(default[^)]*\))", r"\033[90m\1\033[0m", desc, flags=re.IGNORECASE)
+                    lines.append(f"{indent}{c_inv}{c_desc}")
+                else:
+                    m2 = re.match(r"^(\s{2,})(.*?)$", line)
+                    if m2:
+                        lines.append(f"{m2.group(1)}{self._colorize_invocation(m2.group(2))}")
+                    else:
+                        lines.append(line)
+                continue
+
+            # 4. Continuation lines in options (descriptions indented >= 24 chars)
+            if re.match(r"^\s{24,}\S", line):
+                line = re.sub(r"(\(default[^)]*\))", r"\033[90m\1\033[0m", line, flags=re.IGNORECASE)
+                lines.append(line)
+                continue
+
+            # 5. Positional arguments / subcommands
+            m_pos = re.match(r"^(\s{2,})([a-zA-Z0-9_\-]+)(\s{2,})(.*)$", line)
+            if m_pos and not line.strip().startswith("-"):
+                indent, name, sp, desc = m_pos.groups()
+                c_name = f"\033[1;32m{name}\033[0m" if name in ("file", "mic", "ui", "doctor", "config", "show", "set", "reset") else f"\033[33m{name}\033[0m"
+                desc_col = re.sub(r"(\(default[^)]*\))", r"\033[90m\1\033[0m", desc, flags=re.IGNORECASE)
+                lines.append(f"{indent}{c_name}{sp}{desc_col}")
+                continue
+
+            lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _colorize_invocation(inv: str) -> str:
+        parts = []
+        tokens = re.split(r"(-{1,2}[a-zA-Z0-9_\-]+|\{[^}]+\}|[A-Z0-9_\-]+)", inv)
+        for tok in tokens:
+            if tok.startswith("-"):
+                parts.append(f"\033[1;36m{tok}\033[0m")
+            elif tok.startswith("{") or (tok and tok[0].isalnum() and not tok.isspace()):
+                parts.append(f"\033[33m{tok}\033[0m")
+            else:
+                parts.append(tok)
+        return "".join(parts)
+
 
 MEDIA_EXTENSIONS = {
     ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac",
@@ -63,38 +180,55 @@ def _level(args, cfg) -> int:
     return 3 if args.robust else int(cfg["aggressiveness"])
 
 
+def _add_shared_groups(p, is_file: bool = True):
+    g_dsp = p.add_argument_group("ACOUSTIC ENHANCEMENT & SUBFLOOR RECOVERY")
+    g_dsp.add_argument("--dynamic", action="store_true",
+                       help="run 4-model ensemble (gtcrn, hybrid, dpdfnet4, hp) with CN-ROVER fusion and cohesive sentence reconstitution")
+    if is_file:
+        g_dsp.add_argument("--subnoise", action="store_true",
+                           help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
+    g_dsp.add_argument("--auto", action="store_true",
+                       help="dynamically determine window, step, and filtering based on duration and heavy noise floor")
+    g_dsp.add_argument("--rumble-cutoff", type=float, metavar="HZ",
+                       help="zero-phase Butterworth high-pass cutoff in Hz (default: 120)")
+    g_dsp.add_argument("--formant-boost", type=float, metavar="DB",
+                       help="speech formant equalization boost in dB (default: 3.0)")
+    g_dsp.add_argument("--blank-penalty", type=float, metavar="FLOAT",
+                       help="transducer blank penalty (0.0 to 1.5, default: 0.6)")
+    g_dsp.add_argument("--window-size", type=float, metavar="SEC",
+                       help="sliding window length in seconds (subnoise mode, default: 5.0)")
+    g_dsp.add_argument("--step-size", type=float, metavar="SEC",
+                       help="sliding window stride in seconds (subnoise mode, default: 1.25)")
+
+    g_noise = p.add_argument_group("NOISE SUPPRESSION & AGGRESSIVENESS")
+    g_noise.add_argument("-a", "--aggressiveness", type=int, choices=robust.LEVELS, metavar="0-5",
+                         help="noisy-audio effort: 0 off, 1 loose VAD, 2 +denoise, 3 tuned (same as --robust), "
+                              "4 +second variant, keep the more complete, 5 = --distant. Higher = slower")
+    g_noise.add_argument("--robust", action="store_true", help="shortcut for --aggressiveness 3")
+    g_noise.add_argument("--no-fallback", action="store_true",
+                         help="disable progressive fallback escalation when initial VAD detects no speech")
+
+    g_trans = p.add_argument_group("MULTILINGUAL & TRANSLATION")
+    g_trans.add_argument("--lang", metavar="LANG", help="language hint; ignored by models that auto-detect or are English-only")
+    g_trans.add_argument("--lang-source", choices=["auto", "en", "es", "pt"], metavar="{auto,en,es,pt}", default=None,
+                         help="source language: auto (detect), en, es, pt")
+    g_trans.add_argument("--lang-target", choices=["en", "es", "pt"], metavar="{en,es,pt}", default=None,
+                         help="target language for translation: en, es, pt")
+    g_trans.add_argument("--translate", action="store_true",
+                         help="enable translation from source to target language")
+
+    g_hw = p.add_argument_group("HARDWARE & ENGINE CONTROLS")
+    g_hw.add_argument("--threads", type=int, metavar="N", help="CPU inference threads (default from config, 4)")
+    g_hw.add_argument("--model", action="append", metavar="NAME",
+                      help="choose model by name/path; repeatable. `--model list` shows what is installed")
+
+    g_diag = p.add_argument_group("DIAGNOSTICS & WIZARD")
+    g_diag.add_argument("-i", "--interactive", action="store_true",
+                        help="interactive parameter wizard with educational guidance before running")
+
+
 def _common(p):
-    p.add_argument("--threads", type=int, help="inference threads (default from config, 4)")
-    p.add_argument("--model", action="append", metavar="NAME",
-                   help="choose a model by name; its kind (offline/streaming ASR, denoiser, VAD) is detected. "
-                        "Repeatable. `--model list` shows what is installed")
-    p.add_argument("-a", "--aggressiveness", type=int, choices=robust.LEVELS, metavar="0-5",
-                   help="noisy-audio effort: 0 off, 1 loose VAD, 2 +denoise, 3 tuned (same as --robust), "
-                        "4 +second variant, keep the more complete, 5 = --distant. Higher = slower. File and termux-mic only")
-    p.add_argument("--robust", action="store_true", help="shortcut for --aggressiveness 3")
-    p.add_argument("--auto", action="store_true",
-                   help="dynamically determine window, step, and filtering based on duration and heavy noise floor")
-    p.add_argument("-i", "--interactive", action="store_true",
-                   help="interactive parameter wizard with educational guidance before running")
-    p.add_argument("--window-size", type=float, help="sliding window length in seconds (subnoise mode)")
-    p.add_argument("--step-size", type=float, help="sliding window stride in seconds (subnoise mode)")
-    p.add_argument("--dynamic", action="store_true",
-                   help="run multi-model ensemble (gtcrn, hybrid, dpdfnet4, hp) with confusion network ROVER fusion and cohesive sentence reconstitution")
-    p.add_argument("--rumble-cutoff", type=float, help="high-pass filter cutoff in Hz (default 120)")
-    p.add_argument("--formant-boost", type=float, help="formant equalization boost in dB (default 3.0)")
-    p.add_argument("--blank-penalty", type=float, help="transducer blank penalty (0.0 to 1.5, default 0.6)")
-    p.add_argument("--lang", help="language hint; ignored by models that auto-detect or are English-only")
-    p.add_argument("--no-fallback", action="store_true",
-                   help="disable progressive fallback to higher aggressiveness levels when no speech is found")
-    p.add_argument("-t", "--timestamps", action=argparse.BooleanOptionalAction, default=True,
-                   help="display timestamps for each transcribed speech segment (default: true; disable with --no-timestamps)")
-    # Multilingual & Translation
-    p.add_argument("--lang-source", choices=["auto", "en", "es", "pt"], default=None,
-                   help="source language: auto (detect), en, es, pt")
-    p.add_argument("--lang-target", choices=["en", "es", "pt"], default=None,
-                   help="target language for translation: en, es, pt")
-    p.add_argument("--translate", action="store_true",
-                   help="enable translation from source to target language")
+    _add_shared_groups(p, is_file=True)
 
 
 def _lang_note(args):
@@ -705,59 +839,195 @@ def cmd_doctor(args, cfg):
 
 def main(argv=None):
     cfg = config.load()
-    ap = argparse.ArgumentParser(prog="stt", description="Offline speech-to-text (sherpa-onnx, int8, CPU)")
-    ap.add_argument("--version", action="version", version=f"stt {__version__}")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap = argparse.ArgumentParser(
+        prog="stt",
+        description="Offline speech-to-text (sherpa-onnx, int8 quantized models, CPU-only)",
+        formatter_class=ColorHelpFormatter,
+        epilog="""EXAMPLES & USAGE:
+  stt file audio.mp3
+      Transcribe an audio file using default offline ASR.
 
-    f = sub.add_parser("file", help="transcribe audio/video files")
-    f.add_argument("paths", nargs="+", help="audio/video file or directory paths")
-    f.add_argument("-r", "--recursive", action="store_true", help="recursively search directories for audio/video files")
-    f.add_argument("--jsonl", action="store_true", help="JSON lines with start/end/text")
-    f.add_argument("--srt", action="store_true", help="output standard SubRip (.srt) subtitles")
-    f.add_argument("--vtt", action="store_true", help="output WebVTT (.vtt) subtitles")
-    f.add_argument("--sidecar", action="store_true", help="save sidecar subtitle/transcript file next to each input file (e.g. video.mp4 -> video.srt)")
-    f.add_argument("--out", help="write output to this file")
-    f.add_argument("-v", "--verbose", action="store_true", help="print timing / real-time factor to stderr")
-    f.add_argument("--subnoise", action="store_true",
-                   help="aggressive multi-model denoising + formant scanning for low-energy speech near or below noise floor")
-    _common(f)
+  stt file recording.wav --dynamic
+      Run multi-model dynamic ensemble for faint, distant, or noisy speech.
+
+  stt file video.mp4 --srt --sidecar
+      Generate video.srt subtitles alongside the video file.
+
+  stt mic --whisper
+      Live mic transcription with VAD utterance cutting and offline Parakeet.
+
+  stt ui
+      Launch local web UI on http://127.0.0.1:8080 with drag-and-drop.
+
+  stt doctor
+      Verify model files, Python dependencies, ffmpeg, and mic audio backends.
+
+  stt config show
+      Display active configuration and model paths.
+"""
+    )
+    ap.add_argument("--version", action="version", version=f"stt {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True, title="SUBCOMMANDS")
+
+    # --- stt file ---
+    f = sub.add_parser(
+        "file",
+        help="transcribe audio/video files",
+        formatter_class=ColorHelpFormatter,
+        description="Transcribe audio and video files using offline neural ASR and DSP speech enhancement.",
+        epilog="""EXAMPLES & USAGE:
+  stt file interview.mp3
+      Standard transcription with automatic noise profiling.
+
+  stt file audio.wav --dynamic
+      4-model multi-stream ensemble (gtcrn, hybrid, dpdfnet4, hp) with CN-ROVER
+      fusion and cohesive sentence reconstitution for low-energy speech.
+
+  stt file video.mp4 --srt --sidecar
+      Create SubRip subtitle file (video.srt) directly beside input media.
+
+  stt file -r ./recordings/ --sidecar --timestamps
+      Recursively transcribe all audio/video files in a directory.
+
+  stt file noisy.wav --subnoise --rumble-cutoff 140 --formant-boost 4.0 --blank-penalty 0.55
+      Acoustic restoration pipeline targeting speech buried near or below noise floor.
+
+  stt file audio_es.wav --translate --lang-source es --lang-target en
+      Transcribe Spanish speech and translate directly into English (NLLB-200).
+"""
+    )
+    g_f_pos = f.add_argument_group("POSITIONAL ARGUMENTS")
+    g_f_pos.add_argument("paths", nargs="+", metavar="PATH", help="audio/video file or directory paths")
+
+    g_f_io = f.add_argument_group("INPUT & OUTPUT OPTIONS")
+    g_f_io.add_argument("-r", "--recursive", action="store_true", help="recursively search directories for audio/video files")
+    g_f_io.add_argument("--out", metavar="FILE", help="save transcript output to specified file")
+    g_f_io.add_argument("--jsonl", action="store_true", help="output JSON lines with start/end/text")
+    g_f_io.add_argument("--srt", action="store_true", help="output standard SubRip (.srt) subtitles")
+    g_f_io.add_argument("--vtt", action="store_true", help="output WebVTT (.vtt) subtitles")
+    g_f_io.add_argument("--sidecar", action="store_true",
+                        help="save sidecar subtitle/transcript file next to each input file (e.g. video.mp4 -> video.srt)")
+    g_f_io.add_argument("-t", "--timestamps", action=argparse.BooleanOptionalAction, default=True,
+                        help="display timestamps for each transcribed speech segment (default: true; disable with --no-timestamps)")
+
+    _add_shared_groups(f, is_file=True)
+
+    g_f_diag = f.add_argument_group("FILE DIAGNOSTICS & LOGGING")
+    g_f_diag.add_argument("-v", "--verbose", action="store_true", help="print timing / real-time factor (RTF) to stderr")
+
     f.set_defaults(fn=cmd_file)
 
-    m = sub.add_parser("mic", help="live microphone transcription")
-    m.add_argument("--partial", action="store_true", help="show interim text (pulse backend)")
-    m.add_argument("--backend", choices=["pulse", "termux", "windows"], help="override auto-detection")
-    m.add_argument("--jsonl", action="store_true")
-    mic_mode = m.add_mutually_exclusive_group()
+    # --- stt mic ---
+    m = sub.add_parser(
+        "mic",
+        help="live microphone transcription",
+        formatter_class=ColorHelpFormatter,
+        description="Capture live microphone audio and transcribe in real-time or segmented utterances.",
+        epilog="""EXAMPLES & USAGE:
+  stt mic
+      Real-time streaming speech transcription with low latency (Nemotron / Kroko).
+
+  stt mic --whisper
+      High-accuracy utterance decoding on pauses (aggressiveness 3 + Parakeet).
+
+  stt mic --distant
+      Ultra-sensitive VAD for quiet or distant speech from across a room (level 5).
+
+  stt mic --subnoise
+      Sliding ring-buffer acoustic scan with multi-model enhancement.
+
+  stt mic --backend windows --list-devices
+      List available Windows audio capture devices.
+
+  stt mic --partial
+      Show interim transcription tokens as words are spoken.
+"""
+    )
+    g_m_mode = m.add_argument_group("MICROPHONE CAPTURE MODES")
+    mic_mode = g_m_mode.add_mutually_exclusive_group()
     mic_mode.add_argument("--whisper", action="store_true",
-                   help="whispering / noisy room: cut utterances with the VAD, denoise + normalize each, decode with the "
-                        "offline model (text appears when you pause; implies -a 3 unless -a is given)")
+                          help="whispering / noisy room: cut utterances with VAD, denoise + normalize each, decode with offline model (implies -a 3)")
     mic_mode.add_argument("--distant", action="store_true",
-                   help="very quiet / far-away speech: like --whisper but with the most sensitive VAD, larger gain "
-                        "and a normalize-or-denoise decode (level 5)")
+                          help="very quiet / far-away speech: like --whisper with most sensitive VAD, higher gain (level 5)")
     mic_mode.add_argument("--subnoise", action="store_true",
-                   help="continuous sliding ring-buffer scan with multi-model denoising for sub-noise speech")
-    m.add_argument("--list-devices", action="store_true", help="list available audio input devices and exit")
-    m.add_argument("--no-calibrate", action="store_true", help="skip the 2 s room-noise calibration at start")
-    m.add_argument("--save", metavar="WAV", help="also write the raw captured audio (pulse backend) for tuning")
-    m.add_argument("--debug", action="store_true", help="print mic level / AGC gain / VAD state once a second (pulse backend)")
-    _common(m)
+                          help="continuous sliding ring-buffer scan with multi-model denoising for sub-noise speech")
+
+    g_m_stream = m.add_argument_group("STREAMING & OUTPUT OPTIONS")
+    g_m_stream.add_argument("--partial", action="store_true", help="show interim text as words are spoken (pulse backend)")
+    g_m_stream.add_argument("--jsonl", action="store_true", help="output JSON lines with start/end/text")
+    g_m_stream.add_argument("-t", "--timestamps", action=argparse.BooleanOptionalAction, default=True,
+                            help="display timestamps for each transcribed speech segment (default: true; disable with --no-timestamps)")
+
+    _add_shared_groups(m, is_file=False)
+
+    g_m_hw = m.add_argument_group("MICROPHONE HARDWARE & DRIVER CONTROLS")
+    g_m_hw.add_argument("--backend", choices=["pulse", "termux", "windows"], metavar="{pulse,termux,windows}",
+                        help="override auto-detection of audio capture backend")
+    g_m_hw.add_argument("--list-devices", action="store_true", help="list available audio input devices and exit")
+    g_m_hw.add_argument("--no-calibrate", action="store_true", help="skip the 2 s room-noise calibration at start")
+    g_m_hw.add_argument("--save", metavar="WAV", help="also write raw captured audio to WAV file (pulse backend) for tuning")
+    g_m_hw.add_argument("--debug", action="store_true", help="print mic level / AGC gain / VAD state once a second (pulse backend)")
+
     m.set_defaults(fn=cmd_mic)
 
-    u = sub.add_parser("ui", help="launch graphical web front-end with file picker and hotkeys")
-    u.add_argument("--host", default="127.0.0.1", help="server listen address (default 127.0.0.1)")
-    u.add_argument("--port", type=int, default=8080, help="server listen port (default 8080)")
-    u.add_argument("--no-browser", action="store_true", help="do not auto-open browser on launch")
+    # --- stt ui ---
+    u = sub.add_parser(
+        "ui",
+        help="launch graphical web front-end with file picker and hotkeys",
+        formatter_class=ColorHelpFormatter,
+        description="Launch local browser-based GUI with file dropzone, live mic controls, and waveform viewer.",
+        epilog="""EXAMPLES & USAGE:
+  stt ui
+      Launch web UI on http://127.0.0.1:8080 and open default web browser.
+
+  stt ui --port 9000 --no-browser
+      Listen on port 9000 without automatically opening browser.
+"""
+    )
+    g_u = u.add_argument_group("SERVER OPTIONS")
+    g_u.add_argument("--host", default="127.0.0.1", metavar="HOST", help="server listen address (default: 127.0.0.1)")
+    g_u.add_argument("--port", type=int, default=8080, metavar="PORT", help="server listen port (default: 8080)")
+    g_u.add_argument("--no-browser", action="store_true", help="do not auto-open browser on launch")
     u.set_defaults(fn=cmd_ui)
 
-    d = sub.add_parser("doctor", help="check dependencies, models, mic backends")
+    # --- stt doctor ---
+    d = sub.add_parser(
+        "doctor",
+        help="check dependencies, models, mic backends",
+        formatter_class=ColorHelpFormatter,
+        description="Inspect and diagnose Python packages, sherpa-onnx, neural models, ffmpeg, and audio capture backends.",
+        epilog="""EXAMPLES & USAGE:
+  stt doctor
+      Run complete diagnostic report to verify system readiness.
+"""
+    )
     d.set_defaults(fn=cmd_doctor)
 
-    cfg_p = sub.add_parser("config", help="view or edit configuration")
-    cfg_sub = cfg_p.add_subparsers(dest="config_action", required=True)
-    cfg_sub.add_parser("show", help="print config file path and current values")
-    cfg_sub.add_parser("reset", help="delete config file (defaults restored on next run)")
-    cfg_set = cfg_sub.add_parser("set", help="set a config key  (e.g. stt config set threads 2)")
-    cfg_set.add_argument("kv", nargs="+", metavar="KEY VALUE")
+    # --- stt config ---
+    cfg_p = sub.add_parser(
+        "config",
+        help="view or edit configuration",
+        formatter_class=ColorHelpFormatter,
+        description="Inspect, set, or reset persistent configuration settings.",
+        epilog="""EXAMPLES & USAGE:
+  stt config show
+      Display configuration file path and all active values.
+
+  stt config set threads 4
+      Set default CPU inference thread count to 4.
+
+  stt config set blank_penalty 0.65
+      Set default transducer blank penalty.
+
+  stt config reset
+      Delete configuration file and restore factory defaults.
+"""
+    )
+    cfg_sub = cfg_p.add_subparsers(dest="config_action", required=True, title="CONFIG ACTIONS")
+    cfg_sub.add_parser("show", help="print config file path and current values", formatter_class=ColorHelpFormatter)
+    cfg_sub.add_parser("reset", help="delete config file (defaults restored on next run)", formatter_class=ColorHelpFormatter)
+    cfg_set = cfg_sub.add_parser("set", help="set a config key (e.g. stt config set threads 2)", formatter_class=ColorHelpFormatter)
+    cfg_set.add_argument("kv", nargs="+", metavar="KEY VALUE", help="config key followed by desired value")
     cfg_p.set_defaults(fn=cmd_config)
 
     args = ap.parse_args(argv)

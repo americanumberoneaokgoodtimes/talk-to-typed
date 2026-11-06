@@ -73,3 +73,71 @@ def test_collect_media_paths():
         assert "audio2.mp3" in rec_names
         assert "audio3.flac" in rec_names
         assert "notes.txt" not in rec_names
+
+
+def test_color_enabled_env(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    assert not cli._color_enabled()
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    assert cli._color_enabled()
+
+
+def test_color_help_formatter_plain_when_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    formatter = cli.ColorHelpFormatter("stt")
+    help_out = formatter.format_help()
+    assert "\033[" not in help_out
+
+
+def test_color_help_formatter_colorized_when_force_color(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    formatter = cli.ColorHelpFormatter("stt file")
+    dummy_text = (
+        "usage: stt file [-h] [--dynamic]\n\n"
+        "ACOUSTIC ENHANCEMENT:\n"
+        "  --dynamic                   run multi-model ensemble (default: false)\n\n"
+        "EXAMPLES & USAGE:\n"
+        "  stt file audio.mp3\n"
+        "      Transcribe audio file.\n"
+    )
+    colorized = formatter._colorize(dummy_text)
+    assert "\033[1;36mACOUSTIC ENHANCEMENT:\033[0m" in colorized
+    assert "\033[1;36m--dynamic\033[0m" in colorized
+    assert "\033[1;33mEXAMPLES & USAGE:\033[0m" in colorized
+    assert "\033[1;32mstt file\033[0m" in colorized
+
+
+def test_cli_help_sections_and_examples(capsys, monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    # stt file --help
+    with pytest.raises(SystemExit):
+        cli.main(["file", "--help"])
+    captured = capsys.readouterr().out
+    assert "POSITIONAL ARGUMENTS:" in captured
+    assert "INPUT & OUTPUT OPTIONS:" in captured
+    assert "ACOUSTIC ENHANCEMENT & SUBFLOOR RECOVERY:" in captured
+    assert "NOISE SUPPRESSION & AGGRESSIVENESS:" in captured
+    assert "MULTILINGUAL & TRANSLATION:" in captured
+    assert "HARDWARE & ENGINE CONTROLS:" in captured
+    assert "DIAGNOSTICS & WIZARD:" in captured
+    assert "EXAMPLES & USAGE:" in captured
+    assert "stt file audio.wav --dynamic" in captured
+
+    # stt mic --help
+    with pytest.raises(SystemExit):
+        cli.main(["mic", "--help"])
+    captured_mic = capsys.readouterr().out
+    assert "MICROPHONE CAPTURE MODES:" in captured_mic
+    assert "STREAMING & OUTPUT OPTIONS:" in captured_mic
+    assert "ACOUSTIC ENHANCEMENT & SUBFLOOR RECOVERY:" in captured_mic
+    assert "MICROPHONE HARDWARE & DRIVER CONTROLS:" in captured_mic
+    assert "EXAMPLES & USAGE:" in captured_mic
+    assert "stt mic --whisper" in captured_mic
+
