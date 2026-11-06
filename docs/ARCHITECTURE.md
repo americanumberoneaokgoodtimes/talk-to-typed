@@ -77,24 +77,38 @@ stt/
 #### `stt/audio.py`
 - **Audio Ingestion**: Spawns non-blocking `ffmpeg` subprocesses converting any multimedia container into 16 kHz mono 32-bit floating-point arrays normalized to $[-1.0, 1.0]$.
 - **Zero-Phase Butterworth Filter** (`butterworth_highpass`):
-  Frequency-domain filter function:
+  Linearized frequency-domain filtering with symmetric reflection padding (`pad_len = min(N, SR // 2)`) and DC de-meaning:
   $$H(f) = \frac{1}{\sqrt{1 + (f_c / f)^{2N}}}$$
-  Filters rumble with zero phase delay ($H(0) = 0$).
+  Filters low-frequency rumble with zero phase distortion and zero circular convolution edge wrap-around.
 - **Harmonic Hum Rejection** (`harmonic_notch_filter`):
-  Multi-harmonic notch filter centered on $f_0, 2f_0, 3f_0$ (either 50 Hz or 60 Hz fundamental) with a tunable -3 dB bandwidth:
+  Multi-harmonic notch filter centered on $f_0, 2f_0, 3f_0$ (50 Hz or 60 Hz fundamental) with reflection padding to prevent time-domain impulse transients:
   $$H_{\text{notch}}(f) = \prod_{k=1}^{3} \frac{(f - k f_0)^2}{(f - k f_0)^2 + (\Delta f / 2)^2}$$
 - **Speech Formant Band Isolation** (`speech_band_energy`):
-  Isolates spectral energy in the 300 Hz to 3200 Hz human vowel and consonant range via inverse FFT of the band-limited spectrum:
-  $$\text{RMS}_{\text{speech}} = \sqrt{\frac{1}{N} \sum_{n=0}^{N-1} x_{\text{filtered}}[n]^2}$$
+  Direct frequency-domain Parseval integration in the 300 Hz to 3200 Hz range without inverse FFTs:
+  $$\text{RMS}_{\text{speech}} = \sqrt{\frac{2}{N^2} \sum_{k \in \text{band}} |X[k]|^2}$$
+- **Speech Formant & Consonant Shelf Filtering** (`speech_formant_filter`):
+  $C^1$ smooth raised-cosine transitions (150–400 Hz ramp up, 400–3200 Hz core formant lift, 3200–4500 Hz ramp down, 4500–6500 Hz consonant shelf at $\min(\text{boost}, 2.5\text{ dB})$, 6500–7500 Hz roll-off) eliminating sinc ringing while preserving unvoiced fricatives and plosives.
+- **Noise-Bounded AGC** (`noise_bounded_agc`):
+  Acoustically clamped AGC boosting faint speech while strictly bounding ambient noise to $\le 0.025$ RMS ($-32$ dBFS) with soft-tanh saturation, preventing transducer encoder saturation on noise.
 - **Acoustic Profiler** (`profile_audio`):
-  Computes short-time 50ms frame energy quantiles ($P_{15}$ for baseline noise floor, $P_{95}$ for peak energy), calculates empirical SNR, analyzes hum peak prominence, assesses rumble fraction, and dynamically outputs an `AcousticProfile`.
+  Computes short-time frame energy quantiles ($P_{15}$ noise floor, $P_{95}$ peak energy), empirical SNR, multi-harmonic comb prominence (60/120/180 Hz vs 50/100/150 Hz), rumble fraction, and dynamically outputs an `AcousticProfile`.
 
 #### `stt/asr.py`
 - **Recognizer Management**: Caches `sherpa_onnx.OfflineRecognizer` instances configured with `tokens.txt`, `encoder.onnx`, `decoder.onnx`, and `joiner.onnx`.
 - **Batched Stream Decoding** (`transcribe_batch`):
-  Creates multiple concurrent `sherpa_onnx.OfflineStream` handles and invokes `rec.decode_streams(streams)` in a single native multithreaded step. This parallelizes decoding across multiple denoiser candidates without Python thread contention.
+  Creates multiple concurrent `sherpa_onnx.OfflineStream` handles and invokes `rec.decode_streams(streams)` in a single native multithreaded step.
+- **Rich Neural Metadata Extraction** (`transcribe_batch_detailed`):
+  Exposes token timestamps, token durations, token log-probabilities, mean confidence score $\exp(\text{mean}(\log p))$, and TDT zero-skip ratio ($N_{\text{skip}=0} / N$).
 
 #### `stt/robust.py`
+- **Token Shannon Entropy Scoring** (`score_coherence`):
+  Evaluates token probability distribution entropy $H = -\sum p \log_2 p$ to catch degenerate unigram repetition loops ($H < 1.0$) while permitting legitimate human emphatic repetitions (e.g. *"no, no, no"*).
+- **Subnoise Formant & Multi-Stream Scanning** (`subnoise_transcribe`):
+  - 0.75s left/right context margin slices with 50ms Tukey outer edge fades, ensuring Conformer self-attention features are uncorrupted at window boundaries.
+  - Core window token timestamp filtering (`w["start"] \in [L_{\text{margin}}, L_{\text{margin}} + W_{\text{dur}}]`).
+  - TDT zero-skip burst rejection (`zero_skip_ratio > 0.60`).
+  - Parallel multi-candidate evaluation (`gtcrn`, `dpdfnet4`, `hpf`) with confidence-weighted selection.
+  - Word-level fuzzy deduplication across sliding steps and pause-delimited segment finalization ($>0.65$s gap) with timeline timestamps `[MM:SS.mmm -> MM:SS.mmm]`.
 - **Aggressiveness Progression (Levels 0 to 5)**:
   - Level 0: Pure VAD, zero denoising.
   - Level 1: Permissive VAD threshold (0.3).

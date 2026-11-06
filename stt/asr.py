@@ -80,9 +80,15 @@ def transcribe(rec, chunks: list[np.ndarray]) -> list[str]:
 
 def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> list[str]:
     """Batch-decode a small list of candidate audio chunks in parallel using decode_streams."""
+    detailed = transcribe_batch_detailed(rec, chunks, max_batch_size=max_batch_size)
+    return [d["text"] for d in detailed]
+
+
+def transcribe_batch_detailed(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> list[dict]:
+    """Batch-decode candidate chunks in parallel and return rich acoustic/neural decoding metadata."""
     if not chunks:
         return []
-    texts = []
+    results = []
     for i in range(0, len(chunks), max_batch_size):
         batch = chunks[i : i + max_batch_size]
         streams = []
@@ -92,17 +98,30 @@ def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> 
             streams.append(s)
         try:
             rec.decode_streams(streams)
-            for s in streams:
-                texts.append(s.result.text.strip())
         except Exception:
-            # Fallback to single decode if batch decode is unsupported or fails
             for s in streams:
                 try:
                     rec.decode_stream(s)
-                    texts.append(s.result.text.strip())
                 except Exception:
-                    texts.append("")
-    return texts
+                    pass
+        for s in streams:
+            res = s.result
+            log_probs = list(res.ys_log_probs) if hasattr(res, "ys_log_probs") else []
+            conf = float(np.mean(np.exp(log_probs))) if len(log_probs) else 0.0
+            durations = list(res.durations) if hasattr(res, "durations") else []
+            zero_skips = sum(1 for d in durations if d == 0)
+            zero_skip_ratio = float(zero_skips / max(len(durations), 1))
+            results.append({
+                "text": res.text.strip(),
+                "words": list(res.words) if hasattr(res, "words") and res.words else res.text.strip().split(),
+                "tokens": list(res.tokens) if hasattr(res, "tokens") else [],
+                "timestamps": list(res.timestamps) if hasattr(res, "timestamps") else [],
+                "durations": durations,
+                "log_probs": log_probs,
+                "confidence": conf,
+                "zero_skip_ratio": zero_skip_ratio,
+            })
+    return results
 
 
 # Multilingual support

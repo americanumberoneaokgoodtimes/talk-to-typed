@@ -763,3 +763,7 @@ def main(argv=None):
         cfg = asr.apply_model_args(cfg, names)
         args.model = None  # now carried by cfg
     args.fn(args, cfg)
+
+
+if __name__ == "__main__":
+    main()

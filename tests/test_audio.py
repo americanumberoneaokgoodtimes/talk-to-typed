@@ -169,3 +169,52 @@ def test_profile_audio_heavy_rumble_and_snr():
     # Blank penalty dynamically raised for low SNR / heavy noise
     assert prof.blank_penalty >= 0.6
     assert prof.pregate_threshold > 0.0
+
+
+def test_speech_formant_filter():
+    assert len(audio.speech_formant_filter(np.array([], dtype=np.float32), boost_db=4.0)) == 0
+
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False)
+    # Formant tone at 1000 Hz, sub-bass at 50 Hz, and high consonant tone at 5000 Hz
+    s_50 = 0.2 * np.sin(2 * np.pi * 50 * t).astype(np.float32)
+    s_1000 = 0.2 * np.sin(2 * np.pi * 1000 * t).astype(np.float32)
+    s_5000 = 0.2 * np.sin(2 * np.pi * 5000 * t).astype(np.float32)
+    mix = s_50 + s_1000 + s_5000
+
+    boosted = audio.speech_formant_filter(mix, boost_db=6.0)
+    assert len(boosted) == len(mix)
+
+    fft_mix = np.abs(np.fft.rfft(mix))
+    fft_boosted = np.abs(np.fft.rfft(boosted))
+    freqs = np.fft.rfftfreq(len(mix), 1.0 / sr)
+
+    idx_50 = np.argmin(np.abs(freqs - 50.0))
+    idx_1000 = np.argmin(np.abs(freqs - 1000.0))
+    idx_5000 = np.argmin(np.abs(freqs - 5000.0))
+
+    # 50 Hz unchanged (ratio close to 1.0)
+    assert np.isclose(fft_boosted[idx_50] / fft_mix[idx_50], 1.0, atol=0.05)
+    # 1000 Hz boosted by ~6 dB (factor of ~2.0)
+    assert np.isclose(fft_boosted[idx_1000] / fft_mix[idx_1000], 10.0 ** (6.0 / 20.0), rtol=0.05)
+    # 5000 Hz boosted by consonant shelf (~2.5 dB, factor of ~1.33)
+    assert np.isclose(fft_boosted[idx_5000] / fft_mix[idx_5000], 10.0 ** (2.5 / 20.0), rtol=0.05)
+
+
+def test_noise_bounded_agc():
+    assert len(audio.noise_bounded_agc(np.array([], dtype=np.float32), noise_floor_rms=0.001)) == 0
+
+    sr = 16000
+    # Quiet speech-like chunk
+    quiet_speech = (0.01 * np.sin(np.linspace(0, 100, sr))).astype(np.float32)
+    agc_out = audio.noise_bounded_agc(quiet_speech, noise_floor_rms=0.0005, target_speech_rms=0.15, max_noise_floor_rms=0.025)
+    # Scaled up
+    assert np.max(np.abs(agc_out)) > np.max(np.abs(quiet_speech))
+
+    # Pure noise chunk with very low noise floor
+    hiss = np.random.normal(0, 0.002, sr).astype(np.float32)
+    agc_hiss = audio.noise_bounded_agc(hiss, noise_floor_rms=0.002, target_speech_rms=0.18, max_noise_floor_rms=0.025)
+    # Guaranteed noise bounded: RMS cannot explode past max_noise_floor_rms * 1.5
+    hiss_rms = float(np.sqrt(np.mean(agc_hiss ** 2)))
+    assert hiss_rms <= 0.035
+

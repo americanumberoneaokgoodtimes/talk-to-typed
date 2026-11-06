@@ -184,44 +184,135 @@ class NoiseProfile:
 
 
 def butterworth_highpass(samples: np.ndarray, cutoff_hz: float = 120.0, order: int = 4) -> np.ndarray:
-    """Zero-phase Butterworth high-pass filter in frequency domain with no external dependencies."""
+    """Zero-phase Butterworth high-pass filter with symmetric reflection padding to eliminate circular wrap-around."""
     if len(samples) == 0 or cutoff_hz <= 0:
         return samples
-    n = len(samples)
-    fft = np.fft.rfft(samples)
+    n_orig = len(samples)
+    pad_len = min(n_orig, SR // 2)
+    x_mean = float(np.mean(samples))
+    x_centered = samples - x_mean
+    x_padded = np.pad(x_centered, pad_len, mode='reflect')
+
+    n = len(x_padded)
+    fft = np.fft.rfft(x_padded)
     freqs = np.fft.rfftfreq(n, 1.0 / SR)
     freqs[0] = 1e-6
     h = 1.0 / np.sqrt(1.0 + (cutoff_hz / freqs) ** (2 * order))
     h[0] = 0.0
-    return np.fft.irfft(fft * h, n=n).astype(np.float32)
+    filtered = np.fft.irfft(fft * h, n=n)
+    return (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
 
 
 def harmonic_notch_filter(samples: np.ndarray, freqs: tuple[float, ...] = (60.0, 120.0, 180.0), bw_hz: float = 6.0) -> np.ndarray:
-    """Zero-phase parametric harmonic notch rejection for electrical hum and HVAC tones."""
+    """Zero-phase parametric harmonic notch rejection with symmetric reflection padding to eliminate ringing."""
     if len(samples) == 0 or not freqs:
         return samples
-    n = len(samples)
-    fft = np.fft.rfft(samples)
+    n_orig = len(samples)
+    pad_len = min(n_orig, SR // 2)
+    x_mean = float(np.mean(samples))
+    x_centered = samples - x_mean
+    x_padded = np.pad(x_centered, pad_len, mode='reflect')
+
+    n = len(x_padded)
+    fft = np.fft.rfft(x_padded)
     f_axis = np.fft.rfftfreq(n, 1.0 / SR)
     h_notch = np.ones_like(f_axis, dtype=np.float32)
     for f0 in freqs:
         delta = np.abs(f_axis - f0)
         h_notch *= (delta**2) / (delta**2 + (bw_hz / 2.0)**2)
-    return np.fft.irfft(fft * h_notch, n=n).astype(np.float32)
+    filtered = np.fft.irfft(fft * h_notch, n=n)
+    return (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
+
+
+def speech_formant_filter(samples: np.ndarray, boost_db: float = 3.0) -> np.ndarray:
+    """Frequency-domain formant enhancement with smooth raised-cosine transitions
+    and high-frequency consonant shelf to preserve unvoiced fricatives and plosives without sinc ringing."""
+    if boost_db <= 0.0 or len(samples) == 0:
+        return samples
+
+    n_orig = len(samples)
+    pad_len = min(n_orig, SR // 2)
+    x_mean = float(np.mean(samples))
+    x_demeaned = samples - x_mean
+    x_padded = np.pad(x_demeaned, pad_len, mode="reflect")
+    n = len(x_padded)
+
+    fft = np.fft.rfft(x_padded)
+    freqs = np.fft.rfftfreq(n, 1.0 / SR)
+
+    # Smooth transition bands:
+    # 0 dB below 150 Hz
+    # Raised cosine ramp from 150 to 400 Hz up to boost_db
+    # Flat core formant band 400 to 3200 Hz at boost_db
+    # Raised cosine ramp down from 3200 to 4500 Hz to consonant shelf
+    # Flat consonant shelf 4500 to 6500 Hz at min(boost_db, 2.5 dB)
+    # Raised cosine roll-off 6500 to 7500 Hz down to 0 dB
+    # 0 dB above 7500 Hz
+    shelf_db = min(boost_db, 2.5)
+    gain_db = np.zeros_like(freqs)
+
+    r1 = (freqs >= 150.0) & (freqs < 400.0)
+    w1 = (freqs[r1] - 150.0) / (400.0 - 150.0)
+    gain_db[r1] = boost_db * 0.5 * (1.0 - np.cos(np.pi * w1))
+
+    r2 = (freqs >= 400.0) & (freqs < 3200.0)
+    gain_db[r2] = boost_db
+
+    r3 = (freqs >= 3200.0) & (freqs < 4500.0)
+    w3 = (freqs[r3] - 3200.0) / (4500.0 - 3200.0)
+    gain_db[r3] = shelf_db + (boost_db - shelf_db) * 0.5 * (1.0 + np.cos(np.pi * w3))
+
+    r4 = (freqs >= 4500.0) & (freqs < 6500.0)
+    gain_db[r4] = shelf_db
+
+    r5 = (freqs >= 6500.0) & (freqs < 7500.0)
+    w5 = (freqs[r5] - 6500.0) / (7500.0 - 6500.0)
+    gain_db[r5] = shelf_db * 0.5 * (1.0 + np.cos(np.pi * w5))
+
+    linear_gain = 10.0 ** (gain_db / 20.0)
+    filtered = np.fft.irfft(fft * linear_gain, n=n)
+    return (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
 
 
 def speech_band_energy(samples: np.ndarray, low_hz: float = 300.0, high_hz: float = 3200.0) -> float:
-    """Calculate RMS of energy isolated strictly within the human speech formant band (300-3200 Hz)."""
+    """Calculate RMS of energy strictly within speech formant band via frequency-domain Parseval integration."""
     if len(samples) == 0:
         return 0.0
     n = len(samples)
     fft = np.fft.rfft(samples)
     freqs = np.fft.rfftfreq(n, 1.0 / SR)
     mask = (freqs >= low_hz) & (freqs <= high_hz)
-    filtered_fft = np.zeros_like(fft)
-    filtered_fft[mask] = fft[mask]
-    filtered_samples = np.fft.irfft(filtered_fft, n=n)
-    return float(np.sqrt(np.mean(filtered_samples ** 2) + 1e-12))
+    if not np.any(mask):
+        return 0.0
+    mag2 = np.abs(fft[mask]) ** 2
+    is_dc_or_nyq = (freqs[mask] == 0.0) | (freqs[mask] == SR / 2.0)
+    energy = 2.0 * np.sum(mag2[~is_dc_or_nyq]) + np.sum(mag2[is_dc_or_nyq])
+    return float(np.sqrt(max(0.0, energy / (float(n) * float(n))) + 1e-12))
+
+
+def noise_bounded_agc(
+    chunk: np.ndarray,
+    noise_floor_rms: float,
+    target_speech_rms: float = 0.18,
+    max_noise_floor_rms: float = 0.025,
+    max_gain: float = 25.0,
+    min_gain: float = 1.0,
+) -> np.ndarray:
+    """Acoustic AGC that boosts faint speech while preventing ambient noise from saturating the ASR encoder."""
+    if len(chunk) == 0:
+        return chunk
+    p90 = float(np.percentile(np.abs(chunk), 90))
+    if p90 < 1e-6:
+        return chunk
+    noise_cap = max_noise_floor_rms / max(noise_floor_rms, 1e-5)
+    desired_gain = (target_speech_rms * 1.6) / p90
+    effective_gain = float(np.clip(desired_gain, min_gain, min(noise_cap, max_gain)))
+    scaled = chunk * effective_gain
+    peak_val = float(np.max(np.abs(scaled)))
+    if peak_val > 0.85:
+        mask = np.abs(scaled) > 0.70
+        scaled[mask] = np.sign(scaled[mask]) * (0.70 + 0.15 * np.tanh((np.abs(scaled[mask]) - 0.70) / 0.15))
+    return scaled.astype(np.float32)
 
 
 class AcousticProfile:
@@ -314,17 +405,17 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
         bg_val = float(np.median(fft_mag2[bg_mask]) + 1e-12)
         return p_val / bg_val
 
-    prom_60 = peak_prominence(60.0)
-    prom_50 = peak_prominence(50.0)
+    prom_60 = 0.50 * peak_prominence(60.0) + 0.35 * peak_prominence(120.0) + 0.15 * peak_prominence(180.0)
+    prom_50 = 0.50 * peak_prominence(50.0) + 0.35 * peak_prominence(100.0) + 0.15 * peak_prominence(150.0)
 
-    if prom_60 > 4.0 and prom_60 > prom_50 * 1.3:
+    if prom_60 > 3.0 and prom_60 > prom_50 * 1.25:
         hum_freq = 60.0
         notch_freqs = (60.0, 120.0, 180.0)
-        reasoning.append(f"Detected 60 Hz electrical grid hum (prominence={prom_60:.1f}x); engaged notches at 60/120/180 Hz.")
-    elif prom_50 > 4.0 and prom_50 > prom_60 * 1.3:
+        reasoning.append(f"Detected 60 Hz electrical grid hum (harmonic comb prominence={prom_60:.1f}x); engaged notches at 60/120/180 Hz.")
+    elif prom_50 > 3.0 and prom_50 > prom_60 * 1.25:
         hum_freq = 50.0
         notch_freqs = (50.0, 100.0, 150.0)
-        reasoning.append(f"Detected 50 Hz electrical grid hum (prominence={prom_50:.1f}x); engaged notches at 50/100/150 Hz.")
+        reasoning.append(f"Detected 50 Hz electrical grid hum (harmonic comb prominence={prom_50:.1f}x); engaged notches at 50/100/150 Hz.")
     else:
         reasoning.append("No prominent power-grid hum detected; power-line notch filters disabled to preserve vocal pitch.")
 

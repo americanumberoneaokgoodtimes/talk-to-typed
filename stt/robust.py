@@ -120,16 +120,22 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
         return -5.0, f"too fast / hallucination ({wps:.1f} wps)"
 
     from collections import Counter
+    import math
     counts = Counter(words)
     most_common_word, most_common_cnt = counts.most_common(1)[0]
     dom_ratio = most_common_cnt / len(words)
 
-    # Check for degenerate repetition loops (consecutive 3+ identical words, all identical words, or >67% dominance)
-    has_consecutive_3 = any(w1 == w2 == w3 for w1, w2, w3 in zip(words[:-2], words[1:-1], words[2:]))
-    if (len(words) >= 3 and len(counts) == 1) or has_consecutive_3:
-        return 0.05, f"repetitive token '{most_common_word}'"
+    # Calculate token Shannon entropy
+    probs = [c / len(words) for c in counts.values()]
+    entropy = max(0.0, -sum(p * math.log2(p) for p in probs))
 
-    if len(words) >= 4 and dom_ratio >= 0.67:
+    # Check for degenerate repetition loops (4+ words with extreme low entropy or >67% dominance)
+    if len(words) >= 4 and (entropy < 1.0 or dom_ratio >= 0.67):
+        return 0.05, f"repetitive token '{most_common_word}' (entropy={entropy:.2f})"
+
+    # Allow natural short emphatic human repetition (e.g. "no, no, no") up to 3 words
+    has_consecutive_3 = any(w1 == w2 == w3 for w1, w2, w3 in zip(words[:-2], words[1:-1], words[2:]))
+    if has_consecutive_3 and len(words) > 3:
         return 0.05, f"repetitive token '{most_common_word}'"
 
     if len(words) >= 4:
@@ -179,16 +185,12 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
           f"step={tuned.get('step_sec', prof.step_sec)}s, HP={low_hz:.1f}Hz, boost={boost_db:.1f}dB, "
           f"notches={list(notch_freqs)}, blank_penalty={bp:.2f}, pregate={pregate:.6f}", file=sys.stderr)
 
-    # 1. Zero-phase Butterworth HPF + Harmonic Notches + Formant Band Lift
+    # 1. Zero-phase Butterworth HPF + Harmonic Notches + Smooth Formant & Consonant Shelf
     hp = audio.butterworth_highpass(samples, cutoff_hz=low_hz, order=4)
     if notch_freqs:
         hp = audio.harmonic_notch_filter(hp, freqs=notch_freqs, bw_hz=6.0)
     if boost_db > 0.0:
-        fft = np.fft.rfft(hp)
-        freqs = np.fft.rfftfreq(len(hp), 1 / audio.SR)
-        speech_band = (freqs >= 300.0) & (freqs <= 3200.0)
-        fft[speech_band] *= 10.0 ** (boost_db / 20.0)
-        hp = np.fft.irfft(fft, n=len(hp)).astype(np.float32)
+        hp = audio.speech_formant_filter(hp, boost_db=boost_db)
 
     # 2. Multi-model enhancement candidates
     models = []
@@ -209,7 +211,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     else:
         print(f"[stt] Subnoise: using {len(models)} enhancement models: {[m[0] for m in models]}", file=sys.stderr)
 
-    # 3. Sliding window formant scan with speech-band pre-gating
+    # 3. Sliding window formant scan with context margins and speech-band pre-gating
     if len(samples) <= win_len:
         windows = [(0, len(samples))]
     else:
@@ -217,8 +219,10 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         if windows[-1][1] < len(samples):
             windows.append((len(samples) - win_len, len(samples)))
 
-    norm = lambda c: (c * (0.8 / max(float(np.abs(c).max()), 1e-6))).astype(np.float32) if len(c) else c
+    margin_samples = int(0.75 * audio.SR)
+    fade_samples = int(0.05 * audio.SR)
     raw_hits = []
+    emitted_words = []
     total_wins = len(windows)
     escalated_rec = None
     skipped_pregate = 0
@@ -226,6 +230,50 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     # Progress throttling
     last_progress_time = 0.0
     last_progress_pct = -5
+
+    def extract_core_words(item: dict, left_margin_sec: float, core_dur_sec: float, ext_start_sec: float) -> tuple[list[dict], float, str]:
+        tokens = item.get("tokens", [])
+        timestamps = item.get("timestamps", [])
+        durations = item.get("durations", [])
+
+        # Burst hallucination check: zero-skip ratio > 0.60
+        if item.get("zero_skip_ratio", 0.0) > 0.60 and len(tokens) >= 3:
+            return [], -10.0, "zero-skip hallucination burst"
+
+        words_with_meta = []
+        if tokens and len(timestamps) == len(tokens):
+            for tok, ts, dur in zip(tokens, timestamps, durations if len(durations) == len(tokens) else [0.0] * len(tokens)):
+                is_word_start = tok.startswith(" ") or tok.startswith(" ") or not words_with_meta
+                clean_tok = tok.lstrip(" ").lstrip(" ")
+                if not clean_tok:
+                    continue
+                if is_word_start:
+                    words_with_meta.append({"word": clean_tok, "start": float(ts), "end": float(ts + dur)})
+                else:
+                    words_with_meta[-1]["word"] += clean_tok
+                    words_with_meta[-1]["end"] = float(ts + dur)
+        else:
+            raw_text = item.get("text", "")
+            for w in raw_text.split():
+                words_with_meta.append({"word": w, "start": left_margin_sec, "end": left_margin_sec + core_dur_sec})
+
+        # Keep words whose centers or starts fall inside the target core window
+        core_min = left_margin_sec - 0.06
+        core_max = left_margin_sec + core_dur_sec + 0.06
+        core_words = []
+        for w in words_with_meta:
+            if core_min <= w["start"] <= core_max:
+                core_words.append({
+                    "word": w["word"],
+                    "global_start": round(ext_start_sec + w["start"], 3),
+                    "global_end": round(ext_start_sec + w["end"], 3),
+                })
+
+        text = " ".join(w["word"] for w in core_words)
+        sc, reason = score_coherence(text, core_dur_sec)
+        conf = item.get("confidence", 0.5)
+        score = sc * (0.6 + 0.4 * conf)
+        return core_words, score, reason
 
     for idx, (start_idx, end_idx) in enumerate(windows):
         t0 = start_idx / audio.SR
@@ -240,34 +288,50 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                 last_progress_pct = pct
                 last_progress_time = now
 
-        # Adaptive speech-band energy pre-gate
+        # Adaptive speech-band energy pre-gate on core window
         window_raw = hp[start_idx:end_idx]
         sb_rms = audio.speech_band_energy(window_raw)
         if sb_rms < pregate:
             skipped_pregate += 1
             continue
 
-        best_text = ""
-        best_score = -1.0
-        best_model = ""
+        # Context-extended slice with 50ms outer Tukey edge fades
+        ext_start = max(0, start_idx - margin_samples)
+        ext_end = min(len(samples), end_idx + margin_samples)
+        left_margin_sec = (start_idx - ext_start) / audio.SR
+        core_dur_sec = (end_idx - start_idx) / audio.SR
+        ext_start_sec = ext_start / audio.SR
 
-        cand_chunks = [norm(audio_arr[start_idx:end_idx]) for _, audio_arr in models]
+        cand_chunks = []
+        for _, audio_arr in models:
+            c = audio_arr[ext_start:ext_end].copy()
+            if ext_start > 0 and len(c) > fade_samples:
+                c[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+            if ext_end < len(samples) and len(c) > fade_samples:
+                c[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+            c = audio.noise_bounded_agc(c, noise_floor_rms=prof.noise_floor_rms)
+            cand_chunks.append(c)
+
         cand_names = [name for name, _ in models]
 
         # Batch-decode all candidates in parallel across streams
-        cand_texts = asr.transcribe_batch(rec, cand_chunks)
+        cand_details = asr.transcribe_batch_detailed(rec, cand_chunks)
 
-        for name, txt in zip(cand_names, cand_texts):
-            txt_clean = txt.strip()
-            if txt_clean:
-                sc, reason = score_coherence(txt_clean, (end_idx - start_idx) / audio.SR)
-                if sc > best_score:
-                    best_score = sc
-                    best_text = txt_clean
-                    best_model = name
+        best_words = []
+        best_score = -1.0
+        best_text = ""
+        best_model = ""
+
+        for name, item in zip(cand_names, cand_details):
+            words, sc, reason = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
+            txt = " ".join(w["word"] for w in words).strip()
+            if txt and sc > best_score:
+                best_score = sc
+                best_words = words
+                best_text = txt
+                best_model = name
 
         # Dynamic two-stage blank penalty escalation:
-        # If speech energy was present in window but initial penalty emitted nothing, retry with higher blank penalty
         if not best_text and sb_rms > pregate * 1.5:
             if escalated_rec is None:
                 try:
@@ -276,18 +340,31 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                 except Exception:
                     escalated_rec = rec
             if escalated_rec is not rec:
-                esc_texts = asr.transcribe_batch(escalated_rec, cand_chunks)
-                for name, txt in zip(cand_names, esc_texts):
-                    txt_clean = txt.strip()
-                    if txt_clean:
-                        sc, reason = score_coherence(txt_clean, (end_idx - start_idx) / audio.SR)
-                        if sc > best_score:
-                            best_score = sc
-                            best_text = txt_clean
-                            best_model = f"{name}+esc"
+                esc_details = asr.transcribe_batch_detailed(escalated_rec, cand_chunks)
+                for name, item in zip(cand_names, esc_details):
+                    words, sc, reason = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
+                    txt = " ".join(w["word"] for w in words).strip()
+                    if txt and sc > best_score:
+                        best_score = sc
+                        best_words = words
+                        best_text = txt
+                        best_model = f"{name}+esc"
 
         if best_text and best_score > 0.5:
             raw_hits.append((round(t0, 2), round(t1, 2), best_text))
+            # Merge winning words into global word stream with fuzzy duplicate check
+            for cw in best_words:
+                cw_clean = cw["word"].strip(".,?!;:\"'()").lower()
+                duplicate = False
+                for past_w in reversed(emitted_words[-8:]):
+                    if abs(past_w["global_start"] - cw["global_start"]) <= 0.35:
+                        past_clean = past_w["word"].strip(".,?!;:\"'()").lower()
+                        if cw_clean == past_clean:
+                            duplicate = True
+                            break
+                if not duplicate:
+                    emitted_words.append(cw)
+
             if idx % max(1, total_wins // 10) == 0 or idx == total_wins - 1:
                 print(f"[stt] Subnoise window {idx+1}/{total_wins}: '{best_text[:60]}...' "
                       f"(score={best_score:.1f}, model={best_model})", file=sys.stderr)
@@ -296,72 +373,83 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         print(f"[stt] Subnoise pre-gate: skipped {skipped_pregate}/{total_wins} silent/non-vocal windows "
               f"({(skipped_pregate/total_wins)*100:.1f}% CPU saved)", file=sys.stderr)
 
-    # Edge case: skip empty hits
-    raw_hits = [(s, e, t) for s, e, t in raw_hits if t and t.strip()]
+    # 4. Assembly into pause-delimited segments with precise audio timestamps
+    segments = []
+    if emitted_words:
+        curr_seg = [emitted_words[0]]
+        for w in emitted_words[1:]:
+            gap = w["global_start"] - curr_seg[-1]["global_end"]
+            prev_word = curr_seg[-1]["word"]
+            is_punct = prev_word.endswith((".", "!", "?"))
+            if gap > 0.65 or (is_punct and gap > 0.25):
+                seg_text = " ".join(x["word"] for x in curr_seg).strip()
+                if seg_text:
+                    segments.append((round(curr_seg[0]["global_start"], 2), round(curr_seg[-1]["global_end"], 2), seg_text))
+                curr_seg = [w]
+            else:
+                curr_seg.append(w)
+        if curr_seg:
+            seg_text = " ".join(x["word"] for x in curr_seg).strip()
+            if seg_text:
+                segments.append((round(curr_seg[0]["global_start"], 2), round(curr_seg[-1]["global_end"], 2), seg_text))
 
-    if not raw_hits:
-        print("[stt] Subnoise: no coherent speech detected in any window", file=sys.stderr)
-        print("[stt] Subnoise fallback: attempting direct decode of full HP-filtered audio...", file=sys.stderr)
-        txts = asr.transcribe(rec, [hp])
-        txt = txts[0].strip() if txts else ""
-        if txt:
-            print(f"[stt] Subnoise fallback success: '{txt[:80]}...'", file=sys.stderr)
-            return [(0.0, dur, txt)]
-        return []
+    if segments:
+        print(f"[stt] Subnoise: assembled {len(segments)} pause-delimited segments from {len(emitted_words)} words", file=sys.stderr)
+        return segments
 
-    print(f"[stt] Subnoise: collected {len(raw_hits)} window hits, deduplicating...", file=sys.stderr)
-
-    # 4. Punctuation-agnostic window deduplication
-    deduped = []
-    for s, e, text in raw_hits:
-        if not deduped:
-            deduped.append((s, e, text))
-            continue
-        prev_s, prev_e, prev_text = deduped[-1]
-
-        prev_words = [w.strip(".,?!;:\"'()") for w in prev_text.lower().split() if w.strip(".,?!;:\"'()")]
-        curr_words = [w.strip(".,?!;:\"'()") for w in text.lower().split() if w.strip(".,?!;:\"'()")]
-
-        if not curr_words:
-            continue
-        if not prev_words:
-            deduped[-1] = (prev_s, e, text)
-            continue
-
-        # Check if current is subset of previous
-        is_subset = False
-        for i in range(len(prev_words) - len(curr_words) + 1):
-            if prev_words[i:i+len(curr_words)] == curr_words:
-                is_subset = True
-                break
-        if is_subset:
-            continue
-
-        # Check if previous is subset of current
-        is_superset = False
-        for i in range(len(curr_words) - len(prev_words) + 1):
-            if curr_words[i:i+len(prev_words)] == prev_words:
-                is_superset = True
-                break
-        if is_superset:
-            deduped[-1] = (prev_s, e, text)
-            continue
-
-        if s < prev_e:
-            merged = False
-            for k in range(min(len(prev_words), len(curr_words)), 0, -1):
-                if prev_words[-k:] == curr_words[:k]:
-                    combined = " ".join(prev_text.split() + text.split()[k:])
-                    deduped[-1] = (prev_s, e, combined)
-                    merged = True
-                    break
-            if not merged:
+    # Fallback to window-level deduplication if word timestamps were unavailable
+    if raw_hits:
+        print(f"[stt] Subnoise: falling back to window deduplication for {len(raw_hits)} hits...", file=sys.stderr)
+        deduped = []
+        for s, e, text in raw_hits:
+            if not deduped:
                 deduped.append((s, e, text))
-        else:
-            deduped.append((s, e, text))
+                continue
+            prev_s, prev_e, prev_text = deduped[-1]
+            prev_words = [w.strip(".,?!;:\"'()") for w in prev_text.lower().split() if w.strip(".,?!;:\"'()")]
+            curr_words = [w.strip(".,?!;:\"'()") for w in text.lower().split() if w.strip(".,?!;:\"'()")]
+            if not curr_words:
+                continue
+            if not prev_words:
+                deduped[-1] = (prev_s, e, text)
+                continue
+            is_subset = False
+            for i in range(len(prev_words) - len(curr_words) + 1):
+                if prev_words[i:i+len(curr_words)] == curr_words:
+                    is_subset = True
+                    break
+            if is_subset:
+                continue
+            is_superset = False
+            for i in range(len(curr_words) - len(prev_words) + 1):
+                if curr_words[i:i+len(prev_words)] == prev_words:
+                    is_superset = True
+                    break
+            if is_superset:
+                deduped[-1] = (prev_s, e, text)
+                continue
+            if s < prev_e:
+                merged = False
+                for k in range(min(len(prev_words), len(curr_words)), 0, -1):
+                    if prev_words[-k:] == curr_words[:k]:
+                        combined = " ".join(prev_text.split() + text.split()[k:])
+                        deduped[-1] = (prev_s, e, combined)
+                        merged = True
+                        break
+                if not merged:
+                    deduped.append((s, e, text))
+            else:
+                deduped.append((s, e, text))
+        return deduped
 
-    print(f"[stt] Subnoise: final {len(deduped)} segments after deduplication", file=sys.stderr)
-    return deduped
+    print("[stt] Subnoise: no coherent speech detected in any window", file=sys.stderr)
+    print("[stt] Subnoise fallback: attempting direct decode of full HP-filtered audio...", file=sys.stderr)
+    txts = asr.transcribe(rec, [hp])
+    txt = txts[0].strip() if txts else ""
+    if txt:
+        print(f"[stt] Subnoise fallback success: '{txt[:80]}...'", file=sys.stderr)
+        return [(0.0, dur, txt)]
+    return []
 
 
 def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode: str = 'lead', pre: bool = False, subnoise: bool = False, params: dict | None = None, progress_cb=None, model: str | None = None, threads: int | None = None, no_fallback: bool = False) -> list[tuple[float, float, str]]:
