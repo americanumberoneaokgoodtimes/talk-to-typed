@@ -41,9 +41,22 @@ _offline_cache: dict = {}
 _offline_cache_lock = threading.Lock()
 
 
-def offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
+def offline(
+    cfg: dict,
+    model: str | None = None,
+    threads: int | None = None,
+    blank_penalty: float | None = None,
+    decoding_method: str = "greedy_search",
+    max_active_paths: int = 4,
+):
     d = _resolve(cfg, model, "offline_model")
-    kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
+    kwargs = dict(
+        num_threads=threads or cfg["threads"],
+        model_type=_model_type(d),
+        decoding_method=decoding_method,
+    )
+    if decoding_method == "modified_beam_search":
+        kwargs["max_active_paths"] = max_active_paths
     if blank_penalty is not None:
         kwargs["blank_penalty"] = float(blank_penalty)
     return sherpa_onnx.OfflineRecognizer.from_transducer(
@@ -51,12 +64,26 @@ def offline(cfg: dict, model: str | None = None, threads: int | None = None, bla
     )
 
 
-def get_offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
+def get_offline(
+    cfg: dict,
+    model: str | None = None,
+    threads: int | None = None,
+    blank_penalty: float | None = None,
+    decoding_method: str = "greedy_search",
+    max_active_paths: int = 4,
+):
     bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
-    key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key)
+    key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key, decoding_method, max_active_paths)
     with _offline_cache_lock:
         if key not in _offline_cache:
-            _offline_cache[key] = offline(cfg, model=model, threads=threads, blank_penalty=blank_penalty)
+            _offline_cache[key] = offline(
+                cfg,
+                model=model,
+                threads=threads,
+                blank_penalty=blank_penalty,
+                decoding_method=decoding_method,
+                max_active_paths=max_active_paths,
+            )
         return _offline_cache[key]
 
 

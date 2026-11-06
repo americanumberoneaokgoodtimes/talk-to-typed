@@ -437,10 +437,10 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     # Pre-compute continuous local noise floor envelope for dynamic pre-gating
     local_noise_floor = audio.compute_dynamic_pregate_profile(hp)
 
-    # Quantized 3-tier blank penalty recognizer pool
-    rec_t1 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=0.35)
-    rec_t2 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=float(bp or 0.65))
-    rec_t3 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=min(1.15, float(bp or 0.65) + 0.25))
+    # Quantized 3-tier blank penalty recognizer pool with modified_beam_search for subfloor speech recovery
+    rec_t1 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=0.35, decoding_method="modified_beam_search", max_active_paths=16)
+    rec_t2 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=float(bp or 0.65), decoding_method="modified_beam_search", max_active_paths=16)
+    rec_t3 = asr.get_offline(cfg, model=model, threads=threads, blank_penalty=min(1.15, float(bp or 0.65) + 0.25), decoding_method="modified_beam_search", max_active_paths=16)
 
     # 3. Sliding window formant scan with context margins and dynamic pre-gating
     if len(samples) <= win_len:
@@ -681,7 +681,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
 
     print("[stt] Subnoise: no coherent speech detected in any window", file=sys.stderr)
     print("[stt] Subnoise fallback: attempting direct decode of full HP-filtered audio...", file=sys.stderr)
-    txts = asr.transcribe(rec, [hp])
+    txts = asr.transcribe(rec_t2, [hp])
     txt = txts[0].strip() if txts else ""
     if txt:
         print(f"[stt] Subnoise fallback success: '{txt[:80]}...'", file=sys.stderr)
@@ -699,6 +699,15 @@ def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode
         return subnoise_transcribe(rec, samples, cfg, params=params, progress_cb=progress_cb, model=model, threads=threads)
 
     dur_sec = len(samples) / audio.SR
+
+    # 0. Acoustic physical pre-profiling to eliminate infrasound rumble and electrical hum
+    # that saturate dynamic range and blind Silero VAD (Rule 4 of Project Architecture)
+    prof = audio.profile_audio(samples)
+    working_samples = samples
+    if prof.rumble_fraction >= 0.70 or prof.hum_freq is not None:
+        working_samples = audio.butterworth_highpass(samples, cutoff_hz=prof.hpf_cutoff_hz)
+        if prof.notch_freqs:
+            working_samples = audio.harmonic_notch_filter(working_samples, freqs=prof.notch_freqs)
     
     # Helper function to attempt transcription at a specific level
     def try_level(lvl: int, fallback_from: int | None = None) -> list[tuple[float, float, str]]:
@@ -711,12 +720,12 @@ def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode
             print(f"[stt] Using aggressiveness level {lvl}", file=sys.stderr)
 
         if lvl <= 0:
-            segs = list(audio.segments(samples, cfg))
+            segs = list(audio.segments(working_samples, cfg))
             found = [(s, e, t) for (s, e, _), t in zip(segs, asr.transcribe(rec, [g[2] for g in segs])) if t]
             # If VAD found nothing, try decoding the whole clip directly (bypass VAD entirely)
             if not found:
                 print(f"[stt] Level 0 VAD found no segments; attempting direct decode of full audio...", file=sys.stderr)
-                t = asr.transcribe(rec, [samples])[0]
+                t = asr.transcribe(rec, [working_samples])[0]
                 if t:
                     found = [(0.0, dur_sec, t)]
             return found
@@ -724,11 +733,11 @@ def transcribe(rec, samples: np.ndarray, cfg: dict, level: int, noise=None, mode
         den = None
         results = []
         for v in _variants(lvl, cfg):
-            x = audio.normalize(samples) if v.get("norm") else samples
+            x = audio.normalize(working_samples) if v.get("norm") else working_samples
             if v["denoise"]:
                 if den is None:
-                    g = pregain(samples) if pre else 1.0
-                    samples_g = samples * g
+                    g = pregain(working_samples) if pre else 1.0
+                    samples_g = working_samples * g
                     nz = audio.NoiseProfile(noise.clip * g) if (noise is not None and g != 1.0) else noise
                     src = nz.subtract(samples_g) if (noise is not None and mode in ('sub', 'both')) else samples_g
                     den = audio.denoise(src, cfg, nz if mode in ('lead', 'both') else None)

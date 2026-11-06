@@ -180,3 +180,61 @@ def test_merge_words_morphological():
     assert len(emitted) == 2
     assert emitted[1]["word"] == "purse."
 
+
+def test_offline_beam_search_configuration(monkeypatch):
+    """Verify asr.get_offline passes decoding_method and max_active_paths to recognizer."""
+    from stt import asr
+
+    captured_kwargs = {}
+
+    def mock_offline(cfg, model=None, threads=None, blank_penalty=None, decoding_method="greedy_search", max_active_paths=4):
+        captured_kwargs["decoding_method"] = decoding_method
+        captured_kwargs["max_active_paths"] = max_active_paths
+        captured_kwargs["blank_penalty"] = blank_penalty
+        return "mock_recognizer"
+
+    monkeypatch.setattr(asr, "offline", mock_offline)
+    asr._offline_cache.clear()
+
+    rec = asr.get_offline(
+        {"threads": 2, "offline_model": "test"},
+        blank_penalty=0.55,
+        decoding_method="modified_beam_search",
+        max_active_paths=16,
+    )
+    assert rec == "mock_recognizer"
+    assert captured_kwargs["decoding_method"] == "modified_beam_search"
+    assert captured_kwargs["max_active_paths"] == 16
+    assert captured_kwargs["blank_penalty"] == 0.55
+
+
+def test_transcribe_rumble_prefilter(monkeypatch):
+    """Verify robust.transcribe profiles audio and applies Butterworth HPF when rumble > 70%."""
+    from stt import audio
+
+    sr = audio.SR
+    t = np.linspace(0, 1.0, sr, endpoint=False)
+    # 20 Hz infrasound rumble with high amplitude + small 1000 Hz tone
+    heavy_rumble = (1.0 * np.sin(2 * np.pi * 20.0 * t) + 0.05 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+
+    hpf_called = []
+    orig_hpf = audio.butterworth_highpass
+
+    def mock_hpf(samples, cutoff_hz=120.0, order=4):
+        hpf_called.append(cutoff_hz)
+        return orig_hpf(samples, cutoff_hz=cutoff_hz, order=order)
+
+    monkeypatch.setattr(audio, "butterworth_highpass", mock_hpf)
+
+    class DummyRecognizer:
+        pass
+
+    monkeypatch.setattr(robust.asr, "transcribe", lambda r, chunks: [""] * len(chunks))
+
+    cfg = config.load()
+    robust.transcribe(DummyRecognizer(), heavy_rumble, cfg, level=0, no_fallback=True)
+
+    assert len(hpf_called) > 0
+    assert hpf_called[0] >= 120.0
+
+
