@@ -178,6 +178,8 @@ def segments(samples: np.ndarray, cfg: dict):
     If standard Silero VAD detects no speech (e.g. in heavy noise or faint distant speech),
     automatically falls back to harmonic pitch salience VAD to salvage voiced intervals.
     """
+    # Automatically suppress mechanical keyboard clicks and sharp impulses before VAD
+    vad_samples, _ = suppress_impulsive_clicks(samples)
     vad = make_vad(cfg)
     w = cfg.get("vad_window_size", 512)
 
@@ -188,8 +190,8 @@ def segments(samples: np.ndarray, cfg: dict):
             vad.pop()
 
     count = 0
-    for i in range(0, len(samples), w):
-        chunk = samples[i : i + w]
+    for i in range(0, len(vad_samples), w):
+        chunk = vad_samples[i : i + w]
         if len(chunk) < w:
             chunk = np.pad(chunk, (0, w - len(chunk)))
         vad.accept_waveform(chunk)
@@ -203,8 +205,8 @@ def segments(samples: np.ndarray, cfg: dict):
 
     # Harmonicity Fallback: If Silero VAD detected 0 speech segments in noisy/faint audio,
     # evaluate physical glottal periodicity (70-350 Hz) to recover buried utterances.
-    if count == 0 and len(samples) >= int(0.25 * SR):
-        pitch_active = harmonic_pitch_vad(samples, sr=SR)
+    if count == 0 and len(vad_samples) >= int(0.25 * SR):
+        pitch_active = harmonic_pitch_vad(vad_samples, sr=SR)
         hop_sec = 0.010
         min_speech_frames = int(0.12 / hop_sec)
         max_silence_gap = int(0.35 / hop_sec)
@@ -237,10 +239,10 @@ def segments(samples: np.ndarray, cfg: dict):
 
         for sf, ef in intervals:
             s_sec = max(0.0, sf * hop_sec - 0.10)
-            e_sec = min(len(samples) / SR, ef * hop_sec + 0.15)
+            e_sec = min(len(vad_samples) / SR, ef * hop_sec + 0.15)
             s_idx = int(s_sec * SR)
             e_idx = int(e_sec * SR)
-            chunk = samples[s_idx:e_idx]
+            chunk = vad_samples[s_idx:e_idx]
             if len(chunk) > 0:
                 yield s_sec, e_sec, chunk
 
@@ -1064,3 +1066,86 @@ def multiband_formant_agc(
         out_linear = np.tanh(out_linear / 0.75) * 0.75
 
     return out_linear.astype(np.float32)
+
+
+def suppress_impulsive_clicks(
+    samples: np.ndarray,
+    sr: int = SR,
+    threshold_sigma: float = 4.8,
+    max_click_samples: int = 24,
+) -> tuple[np.ndarray, int]:
+    """Pure-NumPy Adaptive Impulse & Keyboard Click Removal.
+
+    Detects ultra-fast mechanical switch transients (<1.5ms) using 2nd-order difference
+    curvature and Median Absolute Deviation (MAD), replacing click samples with cubic Hermite
+    spline inpainting from surrounding clean acoustic context without attenuating speech consonants.
+    """
+    if len(samples) < 128:
+        return samples.copy().astype(np.float32), 0
+
+    out = samples.copy()
+    n = len(out)
+
+    d2 = np.zeros(n, dtype=np.float32)
+    d2[1:-1] = np.abs(out[2:] - 2.0 * out[1:-1] + out[:-2])
+
+    block_len = 256
+    n_blocks = n // block_len
+    if n_blocks > 0:
+        blocks = d2[: n_blocks * block_len].reshape(n_blocks, block_len)
+        med_b = np.median(blocks, axis=1)
+        mad_b = np.median(np.abs(blocks - med_b[:, None]), axis=1) + 1e-8
+
+        local_scale = np.repeat(1.4826 * mad_b, block_len)
+        local_med = np.repeat(med_b, block_len)
+
+        rem = n - len(local_scale)
+        if rem > 0:
+            local_scale = np.pad(local_scale, (0, rem), mode='edge')
+            local_med = np.pad(local_med, (0, rem), mode='edge')
+
+        z_scores = np.abs(d2 - local_med) / local_scale
+    else:
+        med = np.median(d2)
+        mad = np.median(np.abs(d2 - med)) + 1e-8
+        z_scores = np.abs(d2 - med) / (1.4826 * mad)
+
+    outliers = z_scores > threshold_sigma
+    if not np.any(outliers):
+        return out.astype(np.float32), 0
+
+    outlier_idx = np.where(outliers)[0]
+    clusters = []
+    curr = [outlier_idx[0]]
+    for idx in outlier_idx[1:]:
+        if idx - curr[-1] <= 4:
+            curr.append(idx)
+        else:
+            clusters.append((curr[0], curr[-1]))
+            curr = [idx]
+    if curr:
+        clusters.append((curr[0], curr[-1]))
+
+    clicks_removed = 0
+    for s_idx, e_idx in clusters:
+        s = max(0, s_idx - 2)
+        e = min(n - 1, e_idx + 2)
+        width = e - s + 1
+        if width <= max_click_samples:
+            clicks_removed += 1
+            left_val = out[s - 1] if s > 0 else 0.0
+            right_val = out[e + 1] if e < n - 1 else 0.0
+
+            t = np.linspace(0.0, 1.0, width, dtype=np.float32)
+            h00 = (1.0 + 2.0 * t) * (1.0 - t) ** 2
+            h01 = (3.0 - 2.0 * t) * (t ** 2)
+
+            d_left = (out[s - 1] - out[s - 3]) * 0.5 if s > 2 else 0.0
+            d_right = (out[min(n - 1, e + 3)] - out[e + 1]) * 0.5 if e < n - 3 else 0.0
+
+            h10 = t * ((1.0 - t) ** 2)
+            h11 = (t ** 2) * (t - 1.0)
+
+            out[s : e + 1] = h00 * left_val + h01 * right_val + h10 * d_left * width + h11 * d_right * width
+
+    return out.astype(np.float32), clicks_removed

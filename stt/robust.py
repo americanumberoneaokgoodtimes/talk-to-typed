@@ -407,6 +407,11 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     if boost_db > 0.0:
         hp = audio.speech_formant_filter(hp, boost_db=boost_db)
 
+    # Automatically suppress mechanical keyboard clicks and sharp impulses before neural models
+    hp, n_clicks = audio.suppress_impulsive_clicks(hp)
+    if n_clicks > 0:
+        print(f"[stt] Subnoise: suppressed {n_clicks} mechanical impulse clicks", file=sys.stderr)
+
     # 2. Multi-model enhancement candidates with High-Band Spectral Crossover Blending & Pure-NumPy DSP
     models = []
     gtcrn_arr = None

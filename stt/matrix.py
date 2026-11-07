@@ -260,6 +260,7 @@ def run_matrix(
     clean_hp = audio.butterworth_highpass(samples, cutoff_hz=prof.hpf_cutoff_hz)
     if prof.notch_freqs:
         clean_hp = audio.harmonic_notch_filter(clean_hp, freqs=prof.notch_freqs)
+    clean_hp, _ = audio.suppress_impulsive_clicks(clean_hp)
 
     # 2. Pre-compute enhancement layers once
     gtcrn = None

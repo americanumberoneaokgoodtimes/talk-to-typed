@@ -326,3 +326,33 @@ def test_multiband_formant_agc():
     assert np.max(np.abs(boosted)) > np.max(np.abs(faint_formant))
 
 
+def test_suppress_impulsive_clicks():
+    # Empty / short signal handling
+    empty_res, c0 = audio.suppress_impulsive_clicks(np.array([], dtype=np.float32))
+    assert len(empty_res) == 0
+    assert c0 == 0
+
+    sr = 16000
+    t = np.linspace(0, 0.5, int(0.5 * sr), endpoint=False, dtype=np.float32)
+    clean_sine = (0.05 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+
+    # Clean signal should have zero clicks removed
+    clean_out, c_none = audio.suppress_impulsive_clicks(clean_sine, sr=sr)
+    assert c_none == 0
+    assert np.allclose(clean_out, clean_sine, atol=1e-5)
+
+    # Insert 3 sharp mechanical keyboard click spikes (width = 4 samples, amplitude = 0.6)
+    clicky = clean_sine.copy()
+    click_positions = [1000, 3000, 5000]
+    for pos in click_positions:
+        clicky[pos : pos + 4] += np.array([0.5, 0.6, -0.4, 0.2], dtype=np.float32)
+
+    assert np.max(np.abs(clicky)) >= 0.55
+    declicked, count = audio.suppress_impulsive_clicks(clicky, sr=sr, threshold_sigma=4.0)
+
+    # All 3 clicks should be detected and inpainted
+    assert count >= 3
+    # Peak amplitude should be substantially suppressed
+    assert np.max(np.abs(declicked)) < 0.20
+
+
