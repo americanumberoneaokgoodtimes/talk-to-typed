@@ -75,15 +75,23 @@ def get_offline(
     bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
     key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key, decoding_method, max_active_paths)
     with _offline_cache_lock:
-        if key not in _offline_cache:
-            _offline_cache[key] = offline(
-                cfg,
-                model=model,
-                threads=threads,
-                blank_penalty=blank_penalty,
-                decoding_method=decoding_method,
-                max_active_paths=max_active_paths,
-            )
+        if key in _offline_cache:
+            val = _offline_cache.pop(key)
+            _offline_cache[key] = val
+            return val
+        if len(_offline_cache) >= 3:
+            oldest_key = next(iter(_offline_cache))
+            del _offline_cache[oldest_key]
+            import gc
+            gc.collect()
+        _offline_cache[key] = offline(
+            cfg,
+            model=model,
+            threads=threads,
+            blank_penalty=blank_penalty,
+            decoding_method=decoding_method,
+            max_active_paths=max_active_paths,
+        )
         return _offline_cache[key]
 
 
@@ -105,13 +113,13 @@ def transcribe(rec, chunks: list[np.ndarray]) -> list[str]:
     return texts
 
 
-def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> list[str]:
+def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 2) -> list[str]:
     """Batch-decode a small list of candidate audio chunks in parallel using decode_streams."""
     detailed = transcribe_batch_detailed(rec, chunks, max_batch_size=max_batch_size)
     return [d["text"] for d in detailed]
 
 
-def transcribe_batch_detailed(rec, chunks: list[np.ndarray], max_batch_size: int = 4) -> list[dict]:
+def transcribe_batch_detailed(rec, chunks: list[np.ndarray], max_batch_size: int = 2) -> list[dict]:
     """Batch-decode candidate chunks in parallel and return rich acoustic/neural decoding metadata."""
     if not chunks:
         return []
@@ -173,13 +181,21 @@ def get_multilingual_offline(cfg: dict, model: str | None = None, threads: int |
     key = (name, threads or cfg.get("threads", 4), bp_key)
     
     with _multilingual_offline_cache_lock:
-        if key not in _multilingual_offline_cache:
-            kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
-            if blank_penalty is not None:
-                kwargs["blank_penalty"] = float(blank_penalty)
-            _multilingual_offline_cache[key] = sherpa_onnx.OfflineRecognizer.from_transducer(
-                **_files(d), **kwargs
-            )
+        if key in _multilingual_offline_cache:
+            val = _multilingual_offline_cache.pop(key)
+            _multilingual_offline_cache[key] = val
+            return val
+        if len(_multilingual_offline_cache) >= 3:
+            oldest_key = next(iter(_multilingual_offline_cache))
+            del _multilingual_offline_cache[oldest_key]
+            import gc
+            gc.collect()
+        kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
+        if blank_penalty is not None:
+            kwargs["blank_penalty"] = float(blank_penalty)
+        _multilingual_offline_cache[key] = sherpa_onnx.OfflineRecognizer.from_transducer(
+            **_files(d), **kwargs
+        )
         return _multilingual_offline_cache[key]
 
 
