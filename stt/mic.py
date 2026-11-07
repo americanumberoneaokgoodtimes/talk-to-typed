@@ -254,8 +254,13 @@ def run_pulse(cfg: dict, args, emit, src=None):
         preroll.clear()
 
     raw, nblk = [], 0
+    do_declick = getattr(args, "declick", True)
+    thresh = getattr(args, "declick_threshold", 4.8)
+    declicker = audio.StreamingDeclicker(sr=audio.SR, threshold_sigma=thresh) if do_declick else None
     try:
         for b in src.blocks():
+            if declicker:
+                b = declicker.process(b)
             if args.save:
                 raw.append(b)
             nblk += 1
@@ -341,6 +346,9 @@ def run_pulse_utterance(cfg: dict, args, emit, src=None):
     buf, active, silent, started = [], False, 0, 0.0
     pad = np.zeros(int(0.3 * audio.SR), dtype=np.float32)
     raw, nblk = [], 0
+    do_declick = getattr(args, "declick", True)
+    thresh = getattr(args, "declick_threshold", 4.8)
+    declicker = audio.StreamingDeclicker(sr=audio.SR, threshold_sigma=thresh) if do_declick else None
 
     def finish():
         nonlocal buf, active, silent
@@ -353,6 +361,8 @@ def run_pulse_utterance(cfg: dict, args, emit, src=None):
 
     try:
         for b0 in blocks:
+            if declicker:
+                b0 = declicker.process(b0)
             if args.save:
                 raw.append(b0)
             nblk += 1
@@ -498,8 +508,13 @@ def run_pulse_subnoise(cfg: dict, args, emit, src=None):
 
     blocks_since_step = 0
     raw = []
+    do_declick = getattr(args, "declick", True)
+    thresh = getattr(args, "declick_threshold", 4.8)
+    declicker = audio.StreamingDeclicker(sr=audio.SR, threshold_sigma=thresh) if do_declick else None
     try:
         for b in block_iter:
+            if declicker:
+                b = declicker.process(b)
             if args.save:
                 raw.append(b)
             ring.append(b)
@@ -678,6 +693,11 @@ class WindowsDShowSource:
         self.cfg = cfg
         self.rec: subprocess.Popen | None = None
         self.backlog = lambda: 0
+        atexit.register(self.stop)
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, lambda s, f: (self.stop(), sys.exit(1)))
+        if signal.getsignal(signal.SIGINT) is signal.SIG_DFL:
+            signal.signal(signal.SIGINT, lambda s, f: (self.stop(), sys.exit(1)))
 
     def start(self):
         ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")

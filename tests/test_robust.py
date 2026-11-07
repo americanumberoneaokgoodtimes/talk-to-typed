@@ -238,3 +238,54 @@ def test_transcribe_rumble_prefilter(monkeypatch):
     assert hpf_called[0] >= 120.0
 
 
+def test_compute_dynamic_stream_weights():
+    from stt.audio import AcousticProfile
+
+    model_names = ["gtcrn", "hybrid", "dp4", "formant_agc", "spec_gate", "hp"]
+
+    # 1. Drone / heavy rumble regime
+    drone_prof = AcousticProfile(
+        duration_sec=10.0, peak=0.5, rms=0.1, crest_factor=5.0, dynamic_range_db=30.0,
+        noise_floor_rms=0.08, snr_db=3.0, hpf_cutoff_hz=130.0, rumble_fraction=0.92,
+        formant_boost_db=0.0, win_sec=5.0, step_sec=1.25, blank_penalty=0.6,
+        pregate_threshold=0.08, notch_freqs=(), hum_freq=60.0
+    )
+    weights_drone = robust.compute_dynamic_stream_weights(drone_prof, model_names)
+    assert np.isclose(sum(weights_drone.values()), 1.0, atol=1e-2)
+    # GTCRN and Hybrid should dominate in drone regime
+    assert weights_drone["gtcrn"] > weights_drone["formant_agc"]
+
+    # 2. Whisper / subnoise regime (low rumble, low SNR)
+    whisper_prof = AcousticProfile(
+        duration_sec=10.0, peak=0.08, rms=0.02, crest_factor=4.0, dynamic_range_db=20.0,
+        noise_floor_rms=0.015, snr_db=2.5, hpf_cutoff_hz=120.0, rumble_fraction=0.15,
+        formant_boost_db=4.0, win_sec=5.0, step_sec=1.25, blank_penalty=0.8,
+        pregate_threshold=0.015, notch_freqs=(), hum_freq=None
+    )
+    weights_whisper = robust.compute_dynamic_stream_weights(whisper_prof, model_names)
+    assert np.isclose(sum(weights_whisper.values()), 1.0, atol=1e-2)
+    # Hybrid and Formant AGC should have highest weights in whisper regime
+    assert weights_whisper["formant_agc"] > weights_whisper["hp"]
+    assert weights_whisper["hybrid"] > weights_whisper["hp"]
+
+
+def test_cn_rover_fuse_weighted():
+    # Stream 1: Hybrid (high weight 0.35) says "purse"
+    stream1 = {
+        "model": "hybrid",
+        "weight": 0.35,
+        "words": [{"word": "purse", "global_start": 1.0, "global_end": 1.4, "conf": 0.85}]
+    }
+    # Stream 2: Noise hallucination (low weight 0.08) says "thank"
+    stream2 = {
+        "model": "hp",
+        "weight": 0.08,
+        "words": [{"word": "thank", "global_start": 1.0, "global_end": 1.4, "conf": 0.40}]
+    }
+
+    fused = robust.cn_rover_fuse([stream1, stream2], 2.0)
+    assert len(fused) == 1
+    assert fused[0]["word"] == "purse"
+
+
+

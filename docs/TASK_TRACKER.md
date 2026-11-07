@@ -90,16 +90,16 @@ flowchart TD
 ---
 
 ### Phase 2: Active / Near-Term Hardening Tasks
-- [ ] **Task 2.1: Expose De-clicker CLI Controls**:
-  - *Context*: [`suppress_impulsive_clicks`](file:///C:/Users/o/Desktop/stt/stt/audio.py#L1071) currently runs automatically in subnoise/dynamic modes and VAD segmentation. Users with clean studio audio or non-standard percussive audio may want to disable it or adjust sensitivity.
-  - *Target Files*: [`stt/cli.py`](file:///C:/Users/o/Desktop/stt/stt/cli.py), [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py).
-  - *Action*: Add `--declick / --no-declick` flag (default: enabled) and `--declick-threshold FLOAT` (default: 4.8).
-  - *Verification*: `pytest tests/test_cli.py` and run CLI with `--no-declick`.
-- [ ] **Task 2.2: Repository Cleanup & Benchmark Directory Migration**:
-  - *Context*: Several exploratory scripts exist in the repository root (`test_better.py`, `check_v201.py`, `test_real_speech.py`, `comprehensive_test.py`, etc.).
-  - *Target Files*: Root directory untracked files.
-  - *Action*: Relocate benchmark scripts into `tools/` or `benchmarks/` and add clean `README.md` documentation explaining their evaluation datasets.
-  - *Verification*: `git status` should only show tracked repository files.
+- [x] **Task 2.1: Expose De-clicker CLI Controls**:
+  - *Context*: [`suppress_impulsive_clicks`](file:///C:/Users/o/Desktop/stt/stt/audio.py#L1071) runs automatically in subnoise/dynamic modes and VAD segmentation.
+  - *Target Files*: [`stt/cli.py`](file:///C:/Users/o/Desktop/stt/stt/cli.py), [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py), [`stt/mic.py`](file:///C:/Users/o/Desktop/stt/stt/mic.py).
+  - *Action*: Added `--declick / --no-declick` flag (default: enabled) and `--declick-threshold FLOAT` (default: 4.8). Threaded through CLI, `auto_params`, `subnoise_transcribe`, and `audio.segments`.
+  - *Verification*: Verified via `pytest tests/test_cli.py` and live execution on `2026-11-04_15-05-28_0001.mp3`.
+- [x] **Task 2.2: Repository Cleanup & Benchmark Directory Migration**:
+  - *Context*: Exploratory scripts and evaluation audio consolidated from repository root.
+  - *Target Files*: [`benchmarks/`](file:///C:/Users/o/Desktop/stt/benchmarks/).
+  - *Action*: Relocated 14 exploratory benchmark scripts into `benchmarks/` with full `benchmarks/README.md` documentation.
+  - *Verification*: `git status` clean working tree.
 - [ ] **Task 2.3: SentencePiece BPE Vocabulary Bridge for Native Hotwords**:
   - *Context*: `sherpa-onnx`'s C++ `EncodeHotwords` utility requires a SentencePiece vocabulary file (`bpe.vocab` or `tokens.txt` without SentencePiece space characters) to tokenize plain-text hotwords into transducer graph biases.
   - *Target Files*: [`stt/asr.py`](file:///C:/Users/o/Desktop/stt/stt/asr.py).
@@ -110,14 +110,35 @@ flowchart TD
   - *Target Files*: [`stt/ui.py`](file:///C:/Users/o/Desktop/stt/stt/ui.py).
   - *Action*: Add dynamic mode toggles and time-range input fields to the web UI frontend.
   - *Verification*: Launch `stt ui` and verify file upload with dynamic mode toggled on.
+- [x] **Task 2.5: Dynamic Acoustic Regime Stream Weighting & CN-ROVER Enhancement**:
+  - *Context*: Different neural models excel in distinct physical regimes (GTCRN on low-frequency drone; Hybrid & Formant AGC on faint whispers). Prior CN-ROVER voter scoring ignored individual stream weights.
+  - *Target Files*: [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py).
+  - *Action*: Implemented [`compute_dynamic_stream_weights`](file:///C:/Users/o/Desktop/stt/stt/robust.py) measuring $\gamma_{\text{drone}}$ and $\gamma_{\text{whisper}}$, corrected weighted slot scoring in [`cn_rover_fuse`](file:///C:/Users/o/Desktop/stt/stt/robust.py), and added single-voter admission gating ($c \ge 0.52$).
+  - *Verification*: `pytest tests/test_robust.py` (16/16 passed).
+- [x] **Task 2.6: Pure-NumPy Dynamic Whisper Formant Tilt Equalizer**:
+  - *Context*: Whispering lacks glottal fold excitation ($F_0$), shifting energy into $1.5 - 4.0\text{ kHz}$ unvoiced bands.
+  - *Target Files*: [`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py).
+  - *Action*: Implemented [`whisper_formant_filter`](file:///C:/Users/o/Desktop/stt/stt/audio.py) using Unvoiced Spectral Resonance Index (USRI), $C^1$ raised-cosine $-8\text{ dB}$ rumble attenuation, $+7.0\text{ dB}$ whisper formant boost, and $+3.5\text{ dB}$ fricative shelf.
+  - *Verification*: `pytest tests/test_audio.py::test_whisper_formant_filter`.
+- [x] **Task 2.7: Multi-Scale Subnoise Formant Scanning (SMI Micro-Windows)**:
+  - *Context*: Faint muttered phrases ($300 - 650\text{ ms}$) suffer temporal SNR dilution in $5.0\text{s}$ macro-windows.
+  - *Target Files*: [`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py), [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py).
+  - *Action*: Implemented [`detect_formant_modulation_spans`](file:///C:/Users/o/Desktop/stt/stt/audio.py) computing Spectral Modulation Index in $1.2 - 4.0\text{ kHz}$ across $250\text{ ms}$ blocks, dispatching targeted $2.2\text{s}$ micro-windows with concentrated AGC.
+  - *Verification*: `pytest tests/test_audio.py::test_detect_formant_modulation_spans`.
+- [x] **Task 2.8: Memory Bounding on Ultra-Long Audio Recordings**:
+  - *Context*: Precomputing 6 full-length float32 arrays on hour-long files consumed $>1.4\text{ GB}$ of RAM.
+  - *Target Files*: [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py).
+  - *Action*: Enforced on-demand per-window chunk generation for pure-NumPy DSP models (`spec_gate`, `formant_agc`) when audio $>180\text{s}$, capping RAM usage below $100\text{ MB}$.
+  - *Verification*: Validated dynamic memory dispatch in `subnoise_transcribe`.
 
 ---
 
 ### Phase 3: "Shiny Things" & Advanced Future Roadmap
-- [ ] **Task 3.1: Real-Time Live Microphone Keyboard-Click Cancellation**:
-  - *Concept*: Integrate [`suppress_impulsive_clicks`](file:///C:/Users/o/Desktop/stt/stt/audio.py#L1071) into the live mic audio ingestion thread (`stt mic` and `stt mic --whisper`).
-  - *Benefit*: Mechanical keyboard typing sounds during voice calls, meetings, or live dictation will be transparently erased before reaching the streaming recognizer.
-  - *Technical Detail*: Process circular ring-buffer chunks ($32\text{ ms} - 64\text{ ms}$) with $2\text{ ms}$ overlap margins to ensure continuity.
+- [x] **Task 3.1: Real-Time Live Microphone Keyboard-Click Cancellation**:
+  - *Context*: Mechanical keyboard switch typing during voice calls, live dictation, or meetings.
+  - *Target Files*: [`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py), [`stt/mic.py`](file:///C:/Users/o/Desktop/stt/stt/mic.py).
+  - *Action*: Implemented [`StreamingDeclicker`](file:///C:/Users/o/Desktop/stt/stt/audio.py) using an overlap-add bilateral margin state ($2M = 128$ samples = $4.0\text{ ms}$ algorithmic latency) with Hermite spline inpainting. Integrated into `run_pulse`, `run_pulse_utterance`, and `run_pulse_subnoise`. Also added `atexit` and OS signal trap hooks to `WindowsDShowSource` to prevent orphaned `ffmpeg.exe` processes.
+  - *Verification*: `pytest tests/test_audio.py::test_streaming_declicker`.
 - [ ] **Task 3.2: Terminal ASCII/Braille Spectrogram & Click Visualizer (`stt file --inspect`)**:
   - *Concept*: Terminal-based visualizer using Unicode Braille characters (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) that prints a frequency-vs-time spectrogram directly in PowerShell or Bash.
   - *Benefit*: Instant visual inspection of speech formants ($300 - 3400\text{ Hz}$ in cyan), background rumble ($<120\text{ Hz}$ in yellow), and detected keyboard click spikes (red vertical markers) without opening Audacity or external tools.

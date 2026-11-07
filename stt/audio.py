@@ -179,7 +179,12 @@ def segments(samples: np.ndarray, cfg: dict):
     automatically falls back to harmonic pitch salience VAD to salvage voiced intervals.
     """
     # Automatically suppress mechanical keyboard clicks and sharp impulses before VAD
-    vad_samples, _ = suppress_impulsive_clicks(samples)
+    do_declick = cfg.get("declick", True)
+    thresh = float(cfg.get("declick_threshold", 4.8))
+    if do_declick:
+        vad_samples, _ = suppress_impulsive_clicks(samples, threshold_sigma=thresh)
+    else:
+        vad_samples = samples
     vad = make_vad(cfg)
     w = cfg.get("vad_window_size", 512)
 
@@ -1149,3 +1154,194 @@ def suppress_impulsive_clicks(
             out[s : e + 1] = h00 * left_val + h01 * right_val + h10 * d_left * width + h11 * d_right * width
 
     return out.astype(np.float32), clicks_removed
+
+
+def whisper_formant_filter(
+    samples: np.ndarray,
+    sr: int = SR,
+    boost_db: float = 4.0,
+    force_whisper: bool = False,
+) -> np.ndarray:
+    """Pure-NumPy Whisper & Distant Speech Formant Equalizer.
+
+    Detects unvoiced spectral resonance in the 1.5 - 4.0 kHz band and applies dynamic tilt
+    equalization that cuts sub-350 Hz rumble while boosting unvoiced formant ridges.
+    """
+    if len(samples) < 128:
+        return samples.copy().astype(np.float32)
+
+    n_orig = len(samples)
+    pad_len = min(n_orig, sr // 2)
+    x_mean = float(np.mean(samples))
+    x_demeaned = samples - x_mean
+    x_padded = np.pad(x_demeaned, pad_len, mode="reflect")
+    n = len(x_padded)
+
+    fft = np.fft.rfft(x_padded)
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    mag2 = np.abs(fft) ** 2
+
+    # 1. Unvoiced Spectral Resonance Analysis
+    e_low = float(np.sum(mag2[(freqs >= 70.0) & (freqs < 450.0)])) + 1e-12
+    e_whisper = float(np.sum(mag2[(freqs >= 1500.0) & (freqs < 4000.0)])) + 1e-12
+    usri = e_whisper / e_low
+
+    is_whisper = force_whisper or (usri >= 1.6)
+
+    # 2. Synthesize Equalization Curve
+    gain_db = np.zeros_like(freqs, dtype=np.float32)
+
+    g_whisper = min(boost_db + 3.0, 8.5) if is_whisper else boost_db
+    g_low_cut = -8.0 if is_whisper else -3.0
+    g_fricative = 3.5
+
+    # Band 1: 0 - 150 Hz (Low rumble suppression)
+    gain_db[freqs < 150.0] = g_low_cut
+
+    # Band 2: 150 - 350 Hz (Smooth transition to unity)
+    r1 = (freqs >= 150.0) & (freqs < 350.0)
+    w1 = (freqs[r1] - 150.0) / 200.0
+    gain_db[r1] = g_low_cut * 0.5 * (1.0 + np.cos(np.pi * w1))
+
+    # Band 3: 350 - 1500 Hz (Smooth transition up to whisper formant peak)
+    r2 = (freqs >= 350.0) & (freqs < 1500.0)
+    w2 = (freqs[r2] - 350.0) / 1150.0
+    gain_db[r2] = g_whisper * 0.5 * (1.0 - np.cos(np.pi * w2))
+
+    # Band 4: 1500 - 3800 Hz (Flat whisper formant plate)
+    gain_db[(freqs >= 1500.0) & (freqs < 3800.0)] = g_whisper
+
+    # Band 5: 3800 - 5000 Hz (Transition down to consonant shelf)
+    r3 = (freqs >= 3800.0) & (freqs < 5000.0)
+    w3 = (freqs[r3] - 3800.0) / 1200.0
+    gain_db[r3] = g_fricative + (g_whisper - g_fricative) * 0.5 * (1.0 + np.cos(np.pi * w3))
+
+    # Band 6: 5000 - 7200 Hz (Consonant frication shelf)
+    gain_db[(freqs >= 5000.0) & (freqs < 7200.0)] = g_fricative
+
+    # Band 7: 7200 - 8000 Hz (Anti-aliasing Nyquist roll-off)
+    r4 = (freqs >= 7200.0)
+    w4 = (freqs[r4] - 7200.0) / 800.0
+    gain_db[r4] = g_fricative * 0.5 * (1.0 + np.cos(np.pi * w4))
+
+    # 3. Apply Zero-Phase Linear Filtering
+    linear_gain = 10.0 ** (gain_db / 20.0)
+    filtered = np.fft.irfft(fft * linear_gain, n=n)
+
+    out = (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
+    return out
+
+
+def detect_formant_modulation_spans(
+    samples: np.ndarray,
+    sr: int = SR,
+    min_smi: float = 1.85,
+    span_sec: float = 2.2,
+) -> list[tuple[int, int]]:
+    """Proactively detect sub-interval vocal bursts (whispers, short murmurs) using
+    Spectral Modulation Index (SMI) in the human speech formant band (1.2 kHz - 4.0 kHz).
+
+    Returns list of (start_sample, end_sample) indices for targeted micro-windowing.
+    """
+    if len(samples) < int(0.5 * sr):
+        return []
+
+    block_len = int(0.25 * sr)
+    n_blocks = len(samples) // block_len
+    if n_blocks < 2:
+        return []
+
+    n_orig = len(samples)
+    pad_len = min(n_orig, sr // 2)
+    x_padded = np.pad(samples - float(np.mean(samples)), pad_len, mode="reflect")
+    n_fft = len(x_padded)
+
+    fft = np.fft.rfft(x_padded)
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+
+    mask = np.zeros_like(freqs)
+    r_low = (freqs >= 1000.0) & (freqs < 1400.0)
+    w_low = (freqs[r_low] - 1000.0) / 400.0
+    mask[r_low] = 0.5 * (1.0 - np.cos(np.pi * w_low))
+    mask[(freqs >= 1400.0) & (freqs <= 3800.0)] = 1.0
+    r_high = (freqs > 3800.0) & (freqs <= 4200.0)
+    w_high = (freqs[r_high] - 3800.0) / 400.0
+    mask[r_high] = 0.5 * (1.0 + np.cos(np.pi * w_high))
+
+    bp_sig = np.fft.irfft(fft * mask, n=n_fft)[pad_len : pad_len + n_orig]
+
+    rms = np.zeros(n_blocks, dtype=np.float32)
+    for k in range(n_blocks):
+        sub = bp_sig[k * block_len : (k + 1) * block_len]
+        rms[k] = np.sqrt(np.mean(sub ** 2) + 1e-12)
+
+    med_rms = float(np.median(rms))
+    smi = rms / max(med_rms, 1e-6)
+
+    span_len = int(span_sec * sr)
+    half_span = span_len // 2
+
+    spans = []
+    for k in range(n_blocks):
+        if smi[k] >= min_smi:
+            center = int((k + 0.5) * block_len)
+            s = max(0, center - half_span)
+            e = min(n_orig, s + span_len)
+            if e - s < span_len and s > 0:
+                s = max(0, e - span_len)
+            spans.append((s, e))
+
+    if not spans:
+        return []
+
+    merged = [spans[0]]
+    for s, e in spans[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+
+    return merged
+
+
+class StreamingDeclicker:
+    """Stateful, real-time streaming de-clicker for live microphone streams.
+
+    Removes mechanical keyboard switch transients and impulse spikes across
+    streaming chunk boundaries with zero edge pops and fixed 4.0ms algorithmic latency.
+    """
+
+    def __init__(self, sr: int = SR, margin_samples: int = 64, threshold_sigma: float = 4.8):
+        self.sr = sr
+        self.m = margin_samples
+        self.threshold_sigma = threshold_sigma
+        self.tail = np.zeros(2 * self.m, dtype=np.float32)
+        self.clicks_detected = 0
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        """Process incoming 32ms-64ms audio block. Returns cleaned chunk of same length."""
+        if len(chunk) == 0:
+            return chunk
+
+        b_len = len(chunk)
+        composite = np.concatenate([self.tail, chunk.astype(np.float32)])
+
+        cleaned_composite, n_clicks = suppress_impulsive_clicks(
+            composite,
+            sr=self.sr,
+            threshold_sigma=self.threshold_sigma,
+            max_click_samples=24,
+        )
+        self.clicks_detected += n_clicks
+
+        clean_out = cleaned_composite[self.m : self.m + b_len]
+
+        self.tail = cleaned_composite[b_len : b_len + 2 * self.m]
+
+        return clean_out.astype(np.float32)
+
+    def reset(self):
+        self.tail.fill(0.0)
+        self.clicks_detected = 0
+

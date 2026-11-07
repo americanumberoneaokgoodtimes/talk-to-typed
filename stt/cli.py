@@ -201,6 +201,12 @@ def _add_shared_groups(p, is_file: bool = True):
                        help="sliding window length in seconds (subnoise mode, default: 5.0)")
     g_dsp.add_argument("--step-size", type=float, metavar="SEC",
                        help="sliding window stride in seconds (subnoise mode, default: 1.25)")
+    g_dsp.add_argument("--declick", action=argparse.BooleanOptionalAction, default=True,
+                       help="adaptive impulse and keyboard click removal using 2nd-order curvature MAD z-scores "
+                            "and Hermite spline inpainting (default: true; disable with --no-declick)")
+    g_dsp.add_argument("--declick-threshold", type=float, metavar="FLOAT", default=4.8,
+                       help="MAD curvature z-score sensitivity threshold for click detection "
+                            "(default: 4.8; lower values like 3.5 are more aggressive)")
 
     g_noise = p.add_argument_group("NOISE SUPPRESSION & AGGRESSIVENESS")
     g_noise.add_argument("-a", "--aggressiveness", type=int, choices=robust.LEVELS, metavar="0-5",
@@ -544,6 +550,10 @@ def cmd_file(args, cfg):
                     auto_params["win_sec"] = float(args.window_size)
                 if getattr(args, "step_size", None) is not None:
                     auto_params["step_sec"] = float(args.step_size)
+                if getattr(args, "declick", None) is not None:
+                    auto_params["declick"] = bool(args.declick)
+                if getattr(args, "declick_threshold", None) is not None:
+                    auto_params["declick_threshold"] = float(args.declick_threshold)
 
                 if is_dynamic:
                     print(f"\n[stt dynamic] Audio: {path} ({dur:.1f}s)", file=sys.stderr)
@@ -577,11 +587,16 @@ def cmd_file(args, cfg):
                     sys.stderr.flush()
                 
                 no_fallback = getattr(args, "no_fallback", False)
-                
+                cfg_file = dict(cfg)
+                if getattr(args, "declick", None) is not None:
+                    cfg_file["declick"] = bool(args.declick)
+                if getattr(args, "declick_threshold", None) is not None:
+                    cfg_file["declick_threshold"] = float(args.declick_threshold)
+
                 if use_multilingual and (do_translate or lang_source != "en"):
                     # Multilingual transcription with optional translation
                     triples = robust.transcribe_multilingual(
-                        rec, samples, cfg,
+                        rec, samples, cfg_file,
                         source_lang=lang_source,
                         target_lang=lang_target if do_translate else None,
                         translate=do_translate,
@@ -590,7 +605,7 @@ def cmd_file(args, cfg):
                     )
                 else:
                     # Standard English-only transcription
-                    triples = robust.transcribe(rec, samples, cfg, level, subnoise=False, no_fallback=no_fallback)
+                    triples = robust.transcribe(rec, samples, cfg_file, level, subnoise=False, no_fallback=no_fallback)
 
             if time_offset > 0 and triples:
                 if len(triples[0]) == 4:
@@ -867,8 +882,8 @@ def cmd_doctor(args, cfg):
     sys.exit(0 if all_ok else 1)
 
 
-def main(argv=None):
-    cfg = config.load()
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser for the STT CLI."""
     ap = argparse.ArgumentParser(
         prog="stt",
         description="Offline speech-to-text (sherpa-onnx, int8 quantized models, CPU-only)",
@@ -1076,6 +1091,15 @@ def main(argv=None):
     cfg_set.add_argument("kv", nargs="+", metavar="KEY VALUE", help="config key followed by desired value")
     cfg_p.set_defaults(fn=cmd_config)
 
+    return ap
+
+
+_build_parser = build_parser
+
+
+def main(argv=None):
+    cfg = config.load()
+    ap = build_parser()
     args = ap.parse_args(argv)
     names = getattr(args, "model", None) or []
     if "list" in names:

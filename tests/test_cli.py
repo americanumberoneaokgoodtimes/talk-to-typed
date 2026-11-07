@@ -141,3 +141,23 @@ def test_cli_help_sections_and_examples(capsys, monkeypatch):
     assert "EXAMPLES & USAGE:" in captured_mic
     assert "stt mic --whisper" in captured_mic
 
+
+def test_cli_declick_flags():
+    ap = cli._build_parser()
+    args_default = ap.parse_args(["file", "dummy.wav"])
+    assert args_default.declick is True
+    assert args_default.declick_threshold == 4.8
+
+    args_nodeclick = ap.parse_args(["file", "dummy.wav", "--no-declick"])
+    assert args_nodeclick.declick is False
+
+    args_custom = ap.parse_args(["file", "dummy.wav", "--declick", "--declick-threshold", "3.5"])
+    assert args_custom.declick is True
+    assert args_custom.declick_threshold == 3.5
+
+    # Also test mic parser
+    args_mic = ap.parse_args(["mic", "--no-declick", "--declick-threshold", "5.2"])
+    assert args_mic.declick is False
+    assert args_mic.declick_threshold == 5.2
+
+

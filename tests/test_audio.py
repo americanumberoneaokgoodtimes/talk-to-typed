@@ -356,3 +356,75 @@ def test_suppress_impulsive_clicks():
     assert np.max(np.abs(declicked)) < 0.20
 
 
+def test_whisper_formant_filter():
+    sr = 16000
+    t = np.linspace(0, 0.5, int(0.5 * sr), endpoint=False, dtype=np.float32)
+
+    # Empty / short signal handling
+    empty_res = audio.whisper_formant_filter(np.array([], dtype=np.float32))
+    assert len(empty_res) == 0
+
+    # 2500 Hz whisper formant tone
+    whisper_tone = (0.05 * np.sin(2 * np.pi * 2500.0 * t)).astype(np.float32)
+    boosted = audio.whisper_formant_filter(whisper_tone, sr=sr, force_whisper=True)
+    assert len(boosted) == len(whisper_tone)
+    assert boosted.dtype == np.float32
+    gain_db = 20 * np.log10(np.std(boosted) / np.std(whisper_tone))
+    assert 5.0 <= gain_db <= 8.5
+
+    # 100 Hz rumble tone should be attenuated
+    rumble_tone = (0.05 * np.sin(2 * np.pi * 100.0 * t)).astype(np.float32)
+    cut = audio.whisper_formant_filter(rumble_tone, sr=sr, force_whisper=True)
+    cut_db = 20 * np.log10(np.std(cut) / np.std(rumble_tone))
+    assert cut_db <= -6.0
+
+
+def test_detect_formant_modulation_spans():
+    sr = 16000
+    t = np.linspace(0, 4.0, int(4.0 * sr), endpoint=False, dtype=np.float32)
+    noise = (0.005 * np.random.randn(len(t))).astype(np.float32)
+
+    # Short burst at 2.0s in formant band (2000 Hz)
+    burst = (0.15 * np.sin(2 * np.pi * 2000.0 * t[32000:32000 + 4000])).astype(np.float32)
+    sig = noise.copy()
+    sig[32000:32000 + 4000] += burst
+
+    spans = audio.detect_formant_modulation_spans(sig, sr=sr, min_smi=1.80, span_sec=2.2)
+    assert len(spans) >= 1
+    # Check that burst at sample 32000 (t=2.0s) is covered by one of the spans
+    covered = any(s <= 32000 <= e for s, e in spans)
+    assert covered
+
+
+def test_streaming_declicker():
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False, dtype=np.float32)
+    clean_tone = (0.05 * np.sin(2 * np.pi * 500.0 * t)).astype(np.float32)
+
+    spike = np.array([0.5, 0.6, -0.4, 0.2], dtype=np.float32)
+    sig = clean_tone.copy()
+    # Click at sample 3000 and boundary click at sample 511
+    sig[3000:3004] += spike
+    sig[510:514] += spike
+
+    chunk_size = 512
+    margin = 64
+    declicker = audio.StreamingDeclicker(sr=sr, margin_samples=margin, threshold_sigma=4.0)
+
+    streamed_chunks = []
+    for i in range(0, len(sig), chunk_size):
+        chunk = sig[i : i + chunk_size]
+        streamed_chunks.append(declicker.process(chunk))
+
+    out = np.concatenate(streamed_chunks)
+    assert len(out) == len(sig)
+    assert out.dtype == np.float32
+    assert declicker.clicks_detected >= 2
+
+    # Verify peak at 3000 + 64 is suppressed
+    assert np.max(np.abs(out[3050:3080])) < 0.20
+    # Verify boundary click at 510 + 64 is suppressed
+    assert np.max(np.abs(out[560:590])) < 0.20
+
+
+

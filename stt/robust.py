@@ -151,6 +151,39 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
     return round(fitness, 2), "coherent"
 
 
+def compute_dynamic_stream_weights(prof: audio.AcousticProfile, model_names: list[str]) -> dict[str, float]:
+    """Calculate normalized acoustic-aware weights for candidate streams based on noise shape and SNR."""
+    base_weights = {
+        "hybrid": 0.24,
+        "gtcrn": 0.22,
+        "dp4": 0.18,
+        "formant_agc": 0.14,
+        "spec_gate": 0.12,
+        "hp": 0.10,
+    }
+
+    gamma_drone = min(1.0, prof.rumble_fraction * 1.5 + (0.3 if prof.hum_freq else 0.0))
+    gamma_whisper = max(0.0, min(1.0, (8.0 - prof.snr_db) / 10.0)) * (1.0 - gamma_drone * 0.5)
+
+    adj = {
+        "gtcrn": 0.15 * gamma_drone - 0.10 * gamma_whisper,
+        "hybrid": 0.08 * gamma_drone + 0.08 * gamma_whisper,
+        "formant_agc": -0.08 * gamma_drone + 0.18 * gamma_whisper,
+        "dp4": 0.06 * gamma_whisper,
+        "spec_gate": 0.0,
+        "hp": -0.05 * gamma_drone,
+    }
+
+    final_w = {}
+    for name in model_names:
+        bw = base_weights.get(name, 0.15)
+        delta = adj.get(name, 0.0)
+        final_w[name] = max(0.04, bw + delta)
+
+    total = sum(final_w.values()) or 1.0
+    return {k: round(v / total, 4) for k, v in final_w.items()}
+
+
 def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
     """Time-synchronous Confusion Network ROVER hypothesis fusion across candidate streams."""
     valid_streams = [s for s in stream_candidates if s.get("words")]
@@ -161,7 +194,7 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
 
     tagged_words = []
     for s_idx, stream in enumerate(valid_streams):
-        w_weight = stream.get("weight", 1.0)
+        w_weight = stream.get("weight", 0.20)
         for w in stream["words"]:
             tagged_words.append({
                 "word": w["word"],
@@ -195,7 +228,7 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
             slots.append([tw])
 
     fused_words = []
-    n_streams = len(valid_streams)
+    total_slot_weight = sum(stream.get("weight", 0.20) for stream in valid_streams) or 1.0
     for slot in slots:
         grouped = {}
         for w in slot:
@@ -203,10 +236,19 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
             if not clean:
                 continue
             if clean not in grouped:
-                grouped[clean] = {"voters": set(), "weights": 0.0, "confs": [], "words": [], "starts": [], "ends": []}
+                grouped[clean] = {
+                    "voters": set(),
+                    "weights": 0.0,
+                    "confs": [],
+                    "individual_weights": [],
+                    "words": [],
+                    "starts": [],
+                    "ends": []
+                }
             grouped[clean]["voters"].add(w["stream_idx"])
             grouped[clean]["weights"] += w["stream_weight"]
             grouped[clean]["confs"].append(w["conf"])
+            grouped[clean]["individual_weights"].append(w["stream_weight"])
             grouped[clean]["words"].append(w["word"])
             grouped[clean]["starts"].append(w["start"])
             grouped[clean]["ends"].append(w["end"])
@@ -217,11 +259,17 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
         best_clean = None
         best_score = -1.0
         for clean, data in grouped.items():
-            vote_frac = len(data["voters"]) / n_streams
-            mean_conf = float(np.mean(data["confs"])) if data["confs"] else 0.5
-            score = 0.40 * vote_frac + 0.60 * mean_conf
-            if len(data["voters"]) == 1 and mean_conf < 0.55:
-                continue
+            voter_weight_sum = data["weights"]
+            weight_frac = voter_weight_sum / total_slot_weight
+
+            w_arr = np.array(data["individual_weights"], dtype=np.float32)
+            c_arr = np.array(data["confs"], dtype=np.float32)
+            weighted_conf = float(np.sum(w_arr * c_arr) / max(np.sum(w_arr), 1e-6))
+
+            score = 0.45 * weight_frac + 0.55 * weighted_conf
+            if len(data["voters"]) == 1:
+                if weighted_conf < 0.52 or weight_frac < 0.18:
+                    continue
             if score > best_score:
                 best_score = score
                 best_clean = clean
@@ -389,6 +437,8 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     bp = tuned.get("blank_penalty", prof.blank_penalty)
     pregate = float(tuned.get("pregate_threshold", prof.pregate_threshold))
     notch_freqs = tuple(tuned.get("notch_freqs", prof.notch_freqs))
+    do_declick = bool(tuned.get("declick", True))
+    declick_threshold = float(tuned.get("declick_threshold", 4.8))
 
     if bp is not None:
         try:
@@ -405,12 +455,16 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     if notch_freqs:
         hp = audio.harmonic_notch_filter(hp, freqs=notch_freqs, bw_hz=6.0)
     if boost_db > 0.0:
-        hp = audio.speech_formant_filter(hp, boost_db=boost_db)
+        if prof.snr_db <= 6.0:
+            hp = audio.whisper_formant_filter(hp, boost_db=boost_db)
+        else:
+            hp = audio.speech_formant_filter(hp, boost_db=boost_db)
 
     # Automatically suppress mechanical keyboard clicks and sharp impulses before neural models
-    hp, n_clicks = audio.suppress_impulsive_clicks(hp)
-    if n_clicks > 0:
-        print(f"[stt] Subnoise: suppressed {n_clicks} mechanical impulse clicks", file=sys.stderr)
+    if do_declick:
+        hp, n_clicks = audio.suppress_impulsive_clicks(hp, threshold_sigma=declick_threshold)
+        if n_clicks > 0:
+            print(f"[stt] Subnoise: suppressed {n_clicks} mechanical impulse clicks", file=sys.stderr)
 
     # 2. Multi-model enhancement candidates with High-Band Spectral Crossover Blending & Pure-NumPy DSP
     models = []
@@ -432,19 +486,21 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
     except Exception as e:
         print(f"[stt] Warning: DPDFNet4 denoiser unavailable: {e}", file=sys.stderr)
 
-    # Pure-NumPy adaptive decision-directed Wiener filter and 3-band formant AGC
-    try:
-        models.append(("spec_gate", audio.adaptive_spectral_gate(hp)))
-        models.append(("formant_agc", audio.multiband_formant_agc(hp)))
-    except Exception as e:
-        print(f"[stt] Warning: Pure-NumPy DSP filters unavailable: {e}", file=sys.stderr)
+    is_long_audio = len(samples) > 180 * audio.SR
+    if not is_long_audio:
+        # Pure-NumPy adaptive decision-directed Wiener filter and 3-band formant AGC
+        try:
+            models.append(("spec_gate", audio.adaptive_spectral_gate(hp)))
+            models.append(("formant_agc", audio.multiband_formant_agc(hp)))
+        except Exception as e:
+            print(f"[stt] Warning: Pure-NumPy DSP filters unavailable: {e}", file=sys.stderr)
 
     models.append(("hp", hp))
 
-    if len(models) == 1:
-        print("[stt] Warning: No neural denoisers available; using high-pass only", file=sys.stderr)
-    else:
-        print(f"[stt] Subnoise: using {len(models)} enhancement models: {[m[0] for m in models]}", file=sys.stderr)
+    all_cand_names = [m[0] for m in models] + (["spec_gate", "formant_agc"] if is_long_audio else [])
+    stream_weights = compute_dynamic_stream_weights(prof, all_cand_names)
+    print(f"[stt] Subnoise: using {len(all_cand_names)} enhancement streams: {all_cand_names}", file=sys.stderr)
+    print(f"[stt] Subnoise: dynamic stream weights: {stream_weights}", file=sys.stderr)
 
     # Pre-compute continuous local noise floor envelope for dynamic pre-gating
     local_noise_floor = audio.compute_dynamic_pregate_profile(hp)
@@ -593,6 +649,15 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         # Tier 2: Escalation (Ambiguous / Faint / Micro-Burst)
         cand_chunks = [prepare_chunk(audio_arr) for _, audio_arr in models]
         cand_names = [name for name, _ in models]
+        if is_long_audio:
+            hp_chunk = prepare_chunk(hp)
+            try:
+                cand_chunks.append(audio.adaptive_spectral_gate(hp_chunk))
+                cand_names.append("spec_gate")
+                cand_chunks.append(audio.multiband_formant_agc(hp_chunk))
+                cand_names.append("formant_agc")
+            except Exception:
+                pass
 
         # Use Tier 3 escalated recognizer if signal is near noise floor or Tier 1 was empty
         escalate_rec = rec_t3 if (local_snr_db < 3.0 or not probe_txt) else active_rec
@@ -602,7 +667,7 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
         for name, item in zip(cand_names, cand_details):
             words, sc, _ = extract_core_words(item, left_margin_sec, core_dur_sec, ext_start_sec)
             if words:
-                w_weight = 0.35 if name in ("gtcrn", "hybrid") else (0.30 if "dp4" in name else 0.25)
+                w_weight = stream_weights.get(name, 0.20)
                 rover_inputs.append({"words": words, "model": name, "weight": w_weight})
 
         fused_words = cn_rover_fuse(rover_inputs, core_dur_sec)
@@ -616,8 +681,10 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                 print(f"[stt] Subnoise window {idx+1}/{total_wins}: '{fused_txt[:60]}...' "
                       f"(score={sc_fused:.1f}, model=cn_rover)", file=sys.stderr)
         else:
-            # Targeted Micro-Burst Scan for short isolated faint words
+            # Targeted Micro-Burst & SMI Formant Modulation Scan for short isolated faint words
             bursts = audio.detect_micro_bursts(window_raw)
+            if not bursts:
+                bursts = audio.detect_formant_modulation_spans(window_raw, min_smi=1.80, span_sec=2.2)
             for b_start, b_end in bursts:
                 mb_start = start_idx + b_start
                 mb_end = start_idx + b_end
@@ -626,7 +693,8 @@ def subnoise_transcribe(rec, samples: np.ndarray, cfg: dict, params: dict | None
                 mb_lmargin = (mb_start - mb_ext_start) / audio.SR
                 mb_core_dur = (mb_end - mb_start) / audio.SR
 
-                mb_c = models[0][1][mb_ext_start:mb_ext_end].copy()
+                burst_source = models[1][1] if len(models) > 1 and models[1][0] == "hybrid" else models[0][1]
+                mb_c = burst_source[mb_ext_start:mb_ext_end].copy()
                 if mb_ext_start > 0 and len(mb_c) > fade_samples:
                     mb_c[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
                 if mb_ext_end < len(samples) and len(mb_c) > fade_samples:
