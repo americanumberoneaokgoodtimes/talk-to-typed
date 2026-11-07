@@ -904,16 +904,26 @@ def harmonic_pitch_vad(
     hop_sec: float = 0.010,
     f0_min: float = 70.0,
     f0_max: float = 350.0,
-    nccf_threshold: float = 0.35,
-    hcr_threshold: float = 2.5,
+    nccf_threshold: float = 0.40,
+    hcr_threshold: float = 3.0,
 ) -> np.ndarray:
-    """Detect faint voiced speech buried in severe noise using NCCF autocorrelation and HPS.
+    """Detect faint voiced speech buried in severe noise using Cauchy-Schwarz NCCF autocorrelation and HPS.
 
+    Automatically removes electrical hum harmonics (50/60 Hz) and sub-80Hz rumble before pitch tracking.
     Returns a boolean array of speech activity per frame (hop_sec resolution).
     """
+    if len(samples) == 0:
+        return np.array([False], dtype=bool)
+
+    # 1. Conditioning: remove sub-80Hz rumble and electrical hum harmonics
+    filtered = butterworth_highpass(samples, cutoff_hz=80.0)
+    prof = profile_audio(filtered)
+    if prof.notch_freqs:
+        filtered = harmonic_notch_filter(filtered, freqs=prof.notch_freqs)
+
     frame_len = int(frame_sec * sr)
     hop_len = int(hop_sec * sr)
-    n_frames = 1 + (len(samples) - frame_len) // hop_len
+    n_frames = 1 + (len(filtered) - frame_len) // hop_len
     if n_frames <= 0:
         return np.array([False], dtype=bool)
 
@@ -923,7 +933,7 @@ def harmonic_pitch_vad(
     speech_active = np.zeros(n_frames, dtype=bool)
 
     # Pre-emphasis to flatten glottal spectral tilt and accentuate higher harmonics
-    hp_in = samples[1:] - 0.95 * samples[:-1]
+    hp_in = filtered[1:] - 0.95 * filtered[:-1]
     hp_in = np.pad(hp_in, (1, 0))
 
     window = np.hanning(frame_len).astype(np.float32)
@@ -948,8 +958,17 @@ def harmonic_pitch_vad(
         corr = np.fft.irfft(fft_ext * np.conj(fft_c), n=n_fft)
 
         chunk_e = float(np.sum((chunk * window) ** 2))
+        if chunk_e < 1e-8:
+            continue
+
+        # Exact Cauchy-Schwarz normalized cross correlation
+        cum_sq = np.concatenate(([0.0], np.cumsum(ext_chunk ** 2)))
+        del_idx = np.arange(lag_min, lag_max + 1)
+        del_e = cum_sq[del_idx + frame_len] - cum_sq[del_idx]
+        denom = np.sqrt(chunk_e * np.maximum(del_e, 1e-12))
+
         lags_corr = corr[lag_min : lag_max + 1]
-        nccf_max = float(np.max(lags_corr)) / (chunk_e + 1e-7)
+        nccf_max = float(np.max(lags_corr / denom))
 
         # Harmonic Product Spectrum
         mag = np.abs(np.fft.rfft(chunk * window, n=512))
@@ -960,8 +979,15 @@ def harmonic_pitch_vad(
         else:
             hcr = 1.0
 
-        if nccf_max >= nccf_threshold or hcr >= hcr_threshold:
+        if nccf_max >= nccf_threshold and hcr >= hcr_threshold:
             speech_active[i] = True
+
+    # Median filter smoothing (3 frames ~ 30ms) to suppress isolated transient spikes
+    if len(speech_active) >= 3:
+        smoothed = speech_active.copy()
+        for i in range(1, len(speech_active) - 1):
+            smoothed[i] = (speech_active[i-1] and speech_active[i]) or (speech_active[i] and speech_active[i+1]) or (speech_active[i-1] and speech_active[i+1])
+        speech_active = smoothed
 
     return speech_active
 
