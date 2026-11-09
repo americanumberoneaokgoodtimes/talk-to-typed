@@ -194,24 +194,24 @@ def segments(samples: np.ndarray, cfg: dict):
             yield s.start / SR, (s.start + len(s.samples)) / SR, np.asarray(s.samples, dtype=np.float32)
             vad.pop()
 
-    count = 0
+    emitted_spans: list[tuple[float, float]] = []
     for i in range(0, len(vad_samples), w):
         chunk = vad_samples[i : i + w]
         if len(chunk) < w:
             chunk = np.pad(chunk, (0, w - len(chunk)))
         vad.accept_waveform(chunk)
         for seg in drain():
-            count += 1
+            emitted_spans.append((seg[0], seg[1]))
             yield seg
     vad.flush()
     for seg in drain():
-        count += 1
+        emitted_spans.append((seg[0], seg[1]))
         yield seg
 
-    # Harmonicity Fallback: If Silero VAD detected 0 speech segments in noisy/faint audio,
-    # evaluate physical glottal periodicity (70-350 Hz) to recover buried utterances.
-    if count == 0 and len(vad_samples) >= int(0.25 * SR):
-        pitch_active = harmonic_pitch_vad(vad_samples, sr=SR)
+    def _pitch_intervals_in_span(span_samples: np.ndarray, offset_sec: float) -> list[tuple[float, float, np.ndarray]]:
+        if len(span_samples) < int(0.25 * SR):
+            return []
+        pitch_active = harmonic_pitch_vad(span_samples, sr=SR)
         hop_sec = 0.010
         min_speech_frames = int(0.12 / hop_sec)
         max_silence_gap = int(0.35 / hop_sec)
@@ -242,26 +242,58 @@ def segments(samples: np.ndarray, cfg: dict):
             if dur_frames >= min_speech_frames:
                 intervals.append((start_frame, len(pitch_active)))
 
+        recovered = []
         for sf, ef in intervals:
-            s_sec = max(0.0, sf * hop_sec - 0.10)
-            e_sec = min(len(vad_samples) / SR, ef * hop_sec + 0.15)
-            s_idx = int(s_sec * SR)
-            e_idx = int(e_sec * SR)
-            chunk = vad_samples[s_idx:e_idx]
-            if len(chunk) > 0:
-                yield s_sec, e_sec, chunk
+            s_local = max(0.0, sf * hop_sec - 0.10)
+            e_local = min(len(span_samples) / SR, ef * hop_sec + 0.15)
+            s_idx = int(s_local * SR)
+            e_idx = int(e_local * SR)
+            sub_chunk = span_samples[s_idx:e_idx]
+            if len(sub_chunk) > 0:
+                recovered.append((offset_sec + s_local, offset_sec + e_local, sub_chunk))
+        return recovered
+
+    # Harmonicity Fallback: recover voiced speech when Silero VAD misses either the whole clip
+    # or >= 3.0s unsegmented gaps (e.g., when a single loud transient/cough fired Silero elsewhere).
+    total_dur = len(vad_samples) / SR
+    if not emitted_spans and len(vad_samples) >= int(0.25 * SR):
+        for seg in _pitch_intervals_in_span(vad_samples, 0.0):
+            yield seg
+    elif emitted_spans and float(cfg.get("vad_threshold", 0.5)) <= 0.35 and total_dur >= 4.0:
+        cursor = 0.0
+        gaps: list[tuple[float, float]] = []
+        for gs, ge in sorted(emitted_spans):
+            if gs - cursor >= 3.0:
+                gaps.append((cursor, gs))
+            cursor = max(cursor, ge)
+        if total_dur - cursor >= 3.0:
+            gaps.append((cursor, total_dur))
+        for gs, ge in gaps:
+            g_slice = vad_samples[int(gs * SR) : int(ge * SR)]
+            for seg in _pitch_intervals_in_span(g_slice, gs):
+                yield seg
 
 
 _denoisers: dict = {}
 _denoisers_lock = threading.Lock()
 
 
-def denoise(samples: np.ndarray, cfg: dict, noise: "NoiseProfile | None" = None) -> np.ndarray:
-    """Neural speech denoiser (DPDFNet), run in 30 s blocks with overlap to bound memory and avoid boundary artifacts.
+def denoise(
+    samples: np.ndarray,
+    cfg: dict,
+    noise: "NoiseProfile | None" = None,
+    attenuation_limit_db: float | None = None,
+) -> np.ndarray:
+    """Neural speech denoiser (GTCRN / DPDFNet), run in 30 s blocks with causal past pre-roll and crossfade.
 
-    With a calibrated `noise` profile, a clip of the real room noise is prepended as context and dropped afterwards.
+    Uses 1.0 s of past audio pre-roll (or calibrated room `noise` on block 0) to warm up causal RNN
+    hidden states and 50 ms raised-cosine crossfades across block boundaries to eliminate splice clicks.
     """
-    key = (cfg["robust_denoiser"], cfg["threads"])
+    if len(samples) == 0:
+        return samples.copy().astype(np.float32)
+
+    atten_db = float(attenuation_limit_db if attenuation_limit_db is not None else cfg.get("dpdfnet_attenuation_limit_db", 100.0))
+    key = (str(cfg.get("models_dir", "")), cfg["robust_denoiser"], cfg["threads"], round(atten_db, 1))
     with _denoisers_lock:
         if key not in _denoisers:
             c = sherpa_onnx.OfflineSpeechDenoiserConfig()
@@ -270,33 +302,60 @@ def denoise(samples: np.ndarray, cfg: dict, noise: "NoiseProfile | None" = None)
                 c.model.gtcrn.model = path
             else:
                 c.model.dpdfnet.model = path
-                c.model.dpdfnet.attenuation_limit_db = 100.0
+                c.model.dpdfnet.attenuation_limit_db = atten_db
             c.model.num_threads = min(cfg["threads"], 2)
             _denoisers[key] = sherpa_onnx.OfflineSpeechDenoiser(c)
         d = _denoisers[key]
+
     block = 30 * SR
-    # 1 s of lookahead context fed to the denoiser so the model can better denoise the
-    # end of each block; the lookahead output is discarded (next block will process it properly).
-    lookahead = SR
-    parts = []
-    lead = noise.clip if noise is not None else np.zeros(0, np.float32)
+    preroll = SR
+    xfade = int(0.05 * SR)
+    n_total = len(samples)
 
-    for i in range(0, len(samples), block):
-        end = min(i + block + lookahead, len(samples))
-        x = samples[i:end]
-        y = np.asarray(d.run(np.concatenate([lead, x]), SR).samples, dtype=np.float32)[len(lead):]
-        # Keep only the block-length output; the lookahead improves boundary quality but is
-        # reprocessed by the next block, so we don't include it here.
-        if end < len(samples):
-            y = y[:block]
-        parts.append(y)
-        lead = np.zeros(0, np.float32)  # noise lead used only for the first block
+    if n_total <= block:
+        lead = noise.clip if noise is not None else np.zeros(0, np.float32)
+        y = np.asarray(d.run(np.concatenate([lead, samples]), SR).samples, dtype=np.float32)[len(lead):]
+        if len(y) < n_total:
+            y = np.pad(y, (0, n_total - len(y)))
+        return y[:n_total]
 
-    out = np.concatenate(parts) if parts else samples
-    # Denoiser frame-alignment can produce a slightly shorter output; pad to match input.
-    if len(out) < len(samples):
-        out = np.pad(out, (0, len(samples) - len(out)))
-    return out[:len(samples)]
+    out = np.zeros(n_total, dtype=np.float32)
+    prev_end = 0
+    for i in range(0, n_total, block):
+        end = min(i + block, n_total)
+        if i == 0:
+            lead = noise.clip if noise is not None else np.zeros(0, np.float32)
+            raw_in = np.concatenate([lead, samples[0:end]])
+            drop_prefix = len(lead)
+            y_full = np.asarray(d.run(raw_in, SR).samples, dtype=np.float32)
+            y = y_full[drop_prefix:]
+            target_len = end
+            if len(y) < target_len:
+                y = np.pad(y, (0, target_len - len(y)))
+            out[0:end] = y[:target_len]
+            prev_end = end
+        else:
+            pre_start = max(0, i - preroll)
+            raw_in = samples[pre_start:end]
+            y_full = np.asarray(d.run(raw_in, SR).samples, dtype=np.float32)
+            need_len = end - pre_start
+            if len(y_full) < need_len:
+                y_full = np.pad(y_full, (0, need_len - len(y_full)))
+            y_full = y_full[:need_len]
+
+            # Crossfade over the last `xfade` samples prior to `i`
+            xf_len = min(xfade, i - pre_start, prev_end - pre_start)
+            if xf_len > 0:
+                xf_start = i - xf_len
+                w_in = (0.5 * (1.0 - np.cos(np.pi * np.linspace(0.0, 1.0, xf_len, dtype=np.float32))))
+                pre_offset = xf_start - pre_start
+                out[xf_start:i] = out[xf_start:i] * (1.0 - w_in) + y_full[pre_offset : pre_offset + xf_len] * w_in
+
+            body_offset = i - pre_start
+            out[i:end] = y_full[body_offset : body_offset + (end - i)]
+            prev_end = end
+
+    return out
 
 
 def normalize(x: np.ndarray, peak: float = 0.7) -> np.ndarray:
@@ -469,6 +528,91 @@ def speech_band_energy(samples: np.ndarray, low_hz: float = 300.0, high_hz: floa
     return float(np.sqrt(max(0.0, energy / (float(n) * float(n))) + 1e-12))
 
 
+def soft_declip(samples: np.ndarray, clip_ratio: float = 0.985, max_plateau: int = 48) -> tuple[np.ndarray, int]:
+    """Pure-NumPy cubic Hermite declipper that reconstructs hard-saturated waveform peaks before neural denoising.
+
+    Eliminates odd-harmonic square-wave splatter across 300-3500 Hz caused by overdriven cheap microphones.
+    """
+    if len(samples) < 32:
+        return samples.copy().astype(np.float32), 0
+
+    peak = float(np.max(np.abs(samples)))
+    if peak < 0.94:
+        return samples.copy().astype(np.float32), 0
+
+    thresh = clip_ratio * peak
+    clipped = np.abs(samples) >= thresh
+    if not np.any(clipped):
+        return samples.copy().astype(np.float32), 0
+
+    out = samples.astype(np.float32).copy()
+    n = len(out)
+    idx = np.where(clipped)[0]
+    runs: list[tuple[int, int]] = []
+    s_cur = idx[0]
+    e_cur = idx[0]
+    for k in idx[1:]:
+        if k <= e_cur + 1:
+            e_cur = k
+        else:
+            if 2 <= (e_cur - s_cur + 1) <= max_plateau:
+                runs.append((s_cur, e_cur))
+            s_cur = e_cur = k
+    if 2 <= (e_cur - s_cur + 1) <= max_plateau:
+        runs.append((s_cur, e_cur))
+
+    if not runs:
+        return out, 0
+
+    repaired = 0
+    for s, e in runs:
+        if s < 2 or e >= n - 2:
+            continue
+        w = e - s + 1
+        y0 = float(out[s - 1])
+        y1 = float(out[e + 1])
+        m0 = float(out[s - 1] - out[s - 2]) * w
+        m1 = float(out[e + 2] - out[e + 1]) * w
+        t = np.linspace(0.0, 1.0, w + 2, dtype=np.float32)[1:-1]
+        h00 = (2.0 * t**3 - 3.0 * t**2 + 1.0)
+        h10 = (t**3 - 2.0 * t**2 + t)
+        h01 = (-2.0 * t**3 + 3.0 * t**2)
+        h11 = (t**3 - t**2)
+        interp = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
+        out[s : e + 1] = interp
+        repaired += 1
+
+    if repaired > 0:
+        new_peak = float(np.max(np.abs(out)))
+        if new_peak > 0.95:
+            out *= (0.92 / new_peak)
+    return out.astype(np.float32), repaired
+
+
+def extract_auto_noise_profile(samples: np.ndarray, sr: int = SR, clip_sec: float = 1.25) -> "NoiseProfile | None":
+    """Automatically extract a calibrated NoiseProfile from the quietest sustained non-zero background span."""
+    win = int(clip_sec * sr)
+    if len(samples) < max(win * 2, int(2.0 * sr)):
+        return None
+    hop = max(sr // 4, win // 4)
+    best_rms = float("inf")
+    best_slice = None
+    for start in range(0, len(samples) - win + 1, hop):
+        sl = samples[start : start + win]
+        # Skip codec-muted digital silence spans so we profile true acoustic background floor
+        rms = float(np.sqrt(np.mean(sl ** 2)))
+        nz_frac = float(np.mean(np.abs(sl) > 1e-6))
+        if rms > 2e-5 and nz_frac >= 0.70 and rms < best_rms:
+            best_rms = rms
+            best_slice = sl
+    if best_slice is None:
+        return None
+    try:
+        return NoiseProfile(best_slice.copy())
+    except Exception:
+        return None
+
+
 def noise_bounded_agc(
     chunk: np.ndarray,
     noise_floor_rms: float,
@@ -485,7 +629,8 @@ def noise_bounded_agc(
         return chunk
     noise_cap = max_noise_floor_rms / max(noise_floor_rms, 1e-5)
     desired_gain = (target_speech_rms * 1.6) / p90
-    effective_gain = float(np.clip(desired_gain, min_gain, min(noise_cap, max_gain)))
+    upper_gain = max(min_gain, min(noise_cap, max_gain))
+    effective_gain = float(np.clip(desired_gain, min_gain, upper_gain))
     scaled = chunk * effective_gain
     peak_val = float(np.max(np.abs(scaled)))
     if peak_val > 0.85:
@@ -504,8 +649,8 @@ def spectral_crossover_blend(
 ) -> np.ndarray:
     """Blend neural denoiser's clean low-band (<3.2 kHz) with HP filter's crisp, un-smeared high-band consonants (>4.2 kHz).
 
-    Eliminates neural musical noise and restores fricative articulation (/s/, /sh/, /f/, /t/, /k/)
-    using a zero-phase frequency-domain raised-cosine crossover with dynamic hiss modulation.
+    Uses true time-domain 16 ms frame modulation + spectral flatness gating in 4-7 kHz so stationary broadband
+    hiss is rejected while transient fricative bursts (/s/, /sh/, /f/, /t/, /k/) and structured harmonics pass cleanly.
     """
     if len(denoised) == 0 or len(clean_hp) == 0:
         return denoised
@@ -529,22 +674,45 @@ def spectral_crossover_blend(
     mask_high[ramp_idx] = 0.5 * (1.0 - np.cos(np.pi * w))
     mask_high[freqs >= f_split_high] = 1.0
 
-    # Stationary hiss rejection in high band: check modulation depth in 4-7 kHz
+    # Extract high-band time-domain residual to measure true temporal consonant modulation vs stationary hiss
+    hp_high_td = np.fft.irfft(fft_hp * mask_high, n=n_fft)[pad_len : pad_len + m].astype(np.float32)
+    den_low_td = np.fft.irfft(fft_den * (1.0 - mask_high * hp_high_weight), n=n_fft)[pad_len : pad_len + m].astype(np.float32)
+    den_high_td = np.fft.irfft(fft_den * (mask_high * hp_high_weight), n=n_fft)[pad_len : pad_len + m].astype(np.float32)
+
     hiss_mask = (freqs >= 4000.0) & (freqs <= 7000.0)
-    effective_hp_weight = hp_high_weight
+    flatness = 1.0
     if np.any(hiss_mask):
-        hp_mag = np.abs(fft_hp[hiss_mask])
-        med = float(np.median(hp_mag) + 1e-9)
-        p90 = float(np.percentile(hp_mag, 90))
-        mod_ratio = p90 / (2.0 * med)
-        effective_hp_weight = float(hp_high_weight * np.clip(mod_ratio, 0.35, 1.0))
+        hb_pow = np.abs(fft_hp[hiss_mask]) ** 2 + 1e-12
+        geom = float(np.exp(np.mean(np.log(hb_pow))))
+        arith = float(np.mean(hb_pow))
+        flatness = geom / max(arith, 1e-12)
 
-    gain_hp = mask_high * effective_hp_weight
-    gain_den = 1.0 - gain_hp
+    f_len = max(64, int(0.016 * sr))
+    n_fr = m // f_len
+    if n_fr >= 4:
+        fr = hp_high_td[: n_fr * f_len].reshape(n_fr, f_len)
+        fr_rms = np.sqrt(np.mean(fr ** 2, axis=1) + 1e-12)
+        floor_hi = float(np.percentile(fr_rms, 20))
+        p90_hi = float(np.percentile(fr_rms, 90))
+        temp_mod = p90_hi / max(floor_hi, 1e-7)
 
-    fft_fused = (fft_den * gain_den) + (fft_hp * gain_hp)
-    fused_padded = np.fft.irfft(fft_fused, n=n_fft)
-    fused = fused_padded[pad_len : pad_len + m]
+        if flatness < 0.35:
+            # Structured harmonic / narrowband high-frequency resonance
+            env_gate = np.ones(m, dtype=np.float32)
+        elif temp_mod < 1.45:
+            # Stationary broadband hiss with minimal consonant burst activity
+            env_gate = np.full(m, 0.18, dtype=np.float32)
+        else:
+            # Time-varying consonant gate: pass bursts above 1.35x floor, attenuate stationary hiss valleys
+            fr_snr = np.clip((fr_rms / max(floor_hi, 1e-7) - 1.15) / 1.5, 0.18, 1.0).astype(np.float32)
+            fr_snr = np.convolve(fr_snr, np.array([0.25, 0.50, 0.25], dtype=np.float32), mode="same")
+            env_gate = np.repeat(fr_snr, f_len)
+            if len(env_gate) < m:
+                env_gate = np.pad(env_gate, (0, m - len(env_gate)), mode="edge")
+    else:
+        env_gate = np.full(m, 0.85 if flatness < 0.45 else 0.35, dtype=np.float32)
+
+    fused = den_low_td + den_high_td * (1.0 - env_gate) + (hp_high_td * hp_high_weight) * env_gate
     return fused.astype(np.float32)
 
 
@@ -579,17 +747,34 @@ def evaluate_window_pregate(
     window_samples: np.ndarray,
     local_floor_rms: float,
     sr: int = SR,
+    denoised_window: np.ndarray | None = None,
 ) -> bool:
-    """Evaluate whether a window should be transcribed using local SNR and Harmonic Formant Contrast (HFC).
+    """Evaluate whether a window should be transcribed using short-frame emergence, syllabic modulation, and HFC.
 
-    Allows faint whispers during quiet intervals and detects formant peaks even below broadband noise floor.
+    Detects brief (<1s) whispers inside 5s windows and sub-noise talking via 2-8 Hz syllabic envelope modulation.
     """
     if len(window_samples) == 0:
         return False
 
     win_rms = float(np.sqrt(np.mean(window_samples ** 2) + 1e-12))
-    if win_rms >= local_floor_rms * 1.20:
+    if win_rms >= local_floor_rms * 1.16:
         return True
+
+    # Check short-time 200ms peak emergence so a 0.8s utterance in a 5s window isn't diluted by 4.2s of noise
+    sub_len = int(0.20 * sr)
+    n_sub = len(window_samples) // sub_len
+    if n_sub >= 3:
+        sub_rms = np.sqrt(np.mean(window_samples[: n_sub * sub_len].reshape(n_sub, sub_len) ** 2, axis=1) + 1e-12)
+        if float(np.percentile(sub_rms, 90)) >= max(local_floor_rms, float(np.percentile(sub_rms, 20))) * 1.28:
+            return True
+
+    if denoised_window is not None and len(denoised_window) >= sub_len * 2:
+        nd = len(denoised_window) // sub_len
+        d_rms = np.sqrt(np.mean(denoised_window[: nd * sub_len].reshape(nd, sub_len) ** 2, axis=1) + 1e-12)
+        d_floor = float(np.percentile(d_rms, 20))
+        d_peak = float(np.max(d_rms))
+        if d_peak >= max(2.5e-4, d_floor * 1.65):
+            return True
 
     fft_mag = np.abs(np.fft.rfft(window_samples))
     freqs = np.fft.rfftfreq(len(window_samples), 1.0 / sr)
@@ -601,7 +786,25 @@ def evaluate_window_pregate(
     mean_val = float(np.mean(sb_mag) + 1e-9)
     peak_val = float(np.max(sb_mag))
     hfc = peak_val / mean_val
-    return hfc >= 5.0
+    if hfc >= 4.4:
+        return True
+
+    # Syllabic 2-8 Hz envelope modulation check for speech buried below broadband stationary noise
+    hop = int(0.025 * sr)
+    n_env = len(window_samples) // hop
+    if n_env >= 16:
+        env = np.sqrt(np.mean(window_samples[: n_env * hop].reshape(n_env, hop) ** 2, axis=1) + 1e-12)
+        log_env = np.log(env + 1e-7) - float(np.mean(np.log(env + 1e-7)))
+        env_fft = np.abs(np.fft.rfft(log_env)) ** 2
+        env_freqs = np.fft.rfftfreq(n_env, 0.025)
+        syl_mask = (env_freqs >= 2.0) & (env_freqs <= 8.0)
+        hi_mask = (env_freqs > 10.0)
+        if np.any(syl_mask) and np.any(hi_mask):
+            syl_ratio = float(np.mean(env_fft[syl_mask])) / float(np.mean(env_fft[hi_mask]) + 1e-9)
+            if syl_ratio >= 3.2:
+                return True
+
+    return False
 
 
 def detect_micro_bursts(
@@ -651,6 +854,7 @@ class AcousticProfile:
 
     def __init__(self, **kwargs):
         self.noise_floor_rms: float = kwargs.get("noise_floor_rms", 1e-4)
+        self.raw_noise_floor_rms: float = kwargs.get("raw_noise_floor_rms", self.noise_floor_rms)
         self.peak_rms: float = kwargs.get("peak_rms", 0.05)
         self.snr_db: float = kwargs.get("snr_db", 10.0)
         self.hum_freq: float | None = kwargs.get("hum_freq", None)
@@ -668,6 +872,7 @@ class AcousticProfile:
     def to_dict(self) -> dict:
         return {
             "noise_floor_rms": round(self.noise_floor_rms, 6),
+            "raw_noise_floor_rms": round(self.raw_noise_floor_rms, 6),
             "peak_rms": round(self.peak_rms, 4),
             "snr_db": round(self.snr_db, 1),
             "hum_freq": self.hum_freq,
@@ -689,27 +894,23 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
     dur = len(samples) / SR
     if len(samples) == 0:
         return AcousticProfile(
-            noise_floor_rms=0.0, peak_rms=0.0, snr_db=0.0, hum_freq=None,
+            noise_floor_rms=0.0, raw_noise_floor_rms=0.0, peak_rms=0.0, snr_db=0.0, hum_freq=None,
             rumble_fraction=0.0, speech_fraction=0.0, hpf_cutoff_hz=120.0,
             notch_freqs=(), formant_boost_db=0.0, blank_penalty=0.6,
             pregate_threshold=0.0, win_sec=5.0, step_sec=1.75, reasoning=["Empty audio sample"]
         )
 
-    # 1. Quantile tracking of short-time frame energies (50ms frames = 800 samples)
+    # 1. Raw frame energies (50ms frames = 800 samples) for quiet-frame selection
     frame_len = int(0.05 * SR)
     n_frames = len(samples) // frame_len
     if n_frames > 0:
-        frames = samples[:n_frames * frame_len].reshape(n_frames, frame_len)
-        frame_rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
-        noise_floor = float(np.percentile(frame_rms, 15))
-        peak_rms = float(np.percentile(frame_rms, 95))
+        raw_frames = samples[:n_frames * frame_len].reshape(n_frames, frame_len)
+        raw_frame_rms = np.sqrt(np.mean(raw_frames ** 2, axis=1) + 1e-12)
+        raw_noise_floor = float(np.percentile(raw_frame_rms, 15))
     else:
-        noise_floor = float(np.sqrt(np.mean(samples ** 2) + 1e-12))
-        peak_rms = noise_floor
+        raw_noise_floor = float(np.sqrt(np.mean(samples ** 2) + 1e-12))
 
-    snr_db = float(20.0 * np.log10(max(peak_rms, 1e-6) / max(noise_floor, 1e-6)))
-
-    # 2. Spectral distribution on representative sample (up to first 60 seconds)
+    # 2. Spectral distribution on representative sample (up to 60 seconds across clip)
     spec_dur = min(len(samples), 60 * SR)
     spec_samples = samples[:spec_dur]
     fft_mag2 = np.abs(np.fft.rfft(spec_samples)) ** 2
@@ -722,36 +923,67 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
     rumble_frac = rumble_energy / total_energy
     speech_frac = speech_energy / total_energy
 
-    # 3. Power-grid hum detection (50 Hz vs 60 Hz spectral peak prominence)
+    # 3. Power-grid hum detection (50 Hz vs 60 Hz spectral peak prominence, Rule 4 > 4.0x)
+    # Measure hum prominence on quiet / non-vocal frames when available so vocal pitch harmonics
+    # (e.g. 100/120/150/180 Hz) on active frames never falsely trigger power-line notches.
+    if n_frames >= 10:
+        q_thresh = float(np.percentile(raw_frame_rms, 35))
+        q_idx = np.where(raw_frame_rms <= max(q_thresh, 1e-7))[0]
+        q_samples = raw_frames[q_idx].flatten() if len(q_idx) > 0 else spec_samples
+        if len(q_samples) >= 4 * frame_len:
+            q_dur = min(len(q_samples), 60 * SR)
+            q_fft_mag2 = np.abs(np.fft.rfft(q_samples[:q_dur])) ** 2
+            q_freqs = np.fft.rfftfreq(q_dur, 1.0 / SR)
+        else:
+            q_fft_mag2, q_freqs = fft_mag2, freqs
+    else:
+        q_fft_mag2, q_freqs = fft_mag2, freqs
+
     hum_freq = None
     notch_freqs: tuple[float, ...] = ()
     reasoning = []
 
     def peak_prominence(center_f: float, half_bw: float = 2.0, bg_bw: float = 8.0) -> float:
-        peak_mask = (freqs >= center_f - half_bw) & (freqs <= center_f + half_bw)
-        bg_mask = (freqs >= center_f - bg_bw) & (freqs <= center_f + bg_bw) & ~peak_mask
+        peak_mask = (q_freqs >= center_f - half_bw) & (q_freqs <= center_f + half_bw)
+        bg_mask = (q_freqs >= center_f - bg_bw) & (q_freqs <= center_f + bg_bw) & ~peak_mask
         if not np.any(peak_mask) or not np.any(bg_mask):
             return 1.0
-        p_val = float(np.max(fft_mag2[peak_mask]))
-        bg_val = float(np.median(fft_mag2[bg_mask]) + 1e-12)
+        p_val = float(np.max(q_fft_mag2[peak_mask]))
+        bg_val = float(np.median(q_fft_mag2[bg_mask]) + 1e-12)
         return p_val / bg_val
 
-    prom_60 = 0.50 * peak_prominence(60.0) + 0.35 * peak_prominence(120.0) + 0.15 * peak_prominence(180.0)
-    prom_50 = 0.50 * peak_prominence(50.0) + 0.35 * peak_prominence(100.0) + 0.15 * peak_prominence(150.0)
+    fund_60 = peak_prominence(60.0)
+    fund_50 = peak_prominence(50.0)
+    prom_60 = 0.50 * fund_60 + 0.35 * peak_prominence(120.0) + 0.15 * peak_prominence(180.0)
+    prom_50 = 0.50 * fund_50 + 0.35 * peak_prominence(100.0) + 0.15 * peak_prominence(150.0)
 
-    if prom_60 > 3.0 and prom_60 > prom_50 * 1.25:
+    if fund_60 >= 2.5 and prom_60 > 4.0 and prom_60 > prom_50 * 1.25:
         hum_freq = 60.0
-        notch_freqs = (60.0, 120.0, 180.0)
-        reasoning.append(f"Detected 60 Hz electrical grid hum (harmonic comb prominence={prom_60:.1f}x); engaged notches at 60/120/180 Hz.")
-    elif prom_50 > 3.0 and prom_50 > prom_60 * 1.25:
+        notches = [60.0, 120.0, 180.0]
+        for h in (240.0, 300.0, 360.0, 420.0, 480.0, 540.0, 600.0):
+            if peak_prominence(h) >= 4.0:
+                notches.append(h)
+        notch_freqs = tuple(notches)
+        reasoning.append(
+            f"Detected 60 Hz electrical grid hum (harmonic comb prominence={prom_60:.1f}x); "
+            f"engaged notches at {'/'.join(str(int(f)) for f in notch_freqs)} Hz."
+        )
+    elif fund_50 >= 2.5 and prom_50 > 4.0 and prom_50 > prom_60 * 1.25:
         hum_freq = 50.0
-        notch_freqs = (50.0, 100.0, 150.0)
-        reasoning.append(f"Detected 50 Hz electrical grid hum (harmonic comb prominence={prom_50:.1f}x); engaged notches at 50/100/150 Hz.")
+        notches = [50.0, 100.0, 150.0]
+        for h in (200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0, 550.0, 600.0):
+            if peak_prominence(h) >= 4.0:
+                notches.append(h)
+        notch_freqs = tuple(notches)
+        reasoning.append(
+            f"Detected 50 Hz electrical grid hum (harmonic comb prominence={prom_50:.1f}x); "
+            f"engaged notches at {'/'.join(str(int(f)) for f in notch_freqs)} Hz."
+        )
     else:
         reasoning.append("No prominent power-grid hum detected; power-line notch filters disabled to preserve vocal pitch.")
 
     # 4. Adaptive low-frequency rumble cutoff
-    if rumble_frac >= 0.75:
+    if rumble_frac >= 0.70:
         hpf_cutoff = 130.0
         reasoning.append(f"Heavy low-frequency rumble dominant ({rumble_frac*100:.1f}% energy <120Hz); raised Butterworth HPF to 130 Hz.")
     elif rumble_frac >= 0.40:
@@ -764,7 +996,40 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
         hpf_cutoff = 80.0
         reasoning.append(f"Low rumble floor ({rumble_frac*100:.1f}%); minimal 80 Hz HPF applied to preserve full vocal harmonics.")
 
-    # 5. Formant boost calculation
+    # 5. Conditioned in-band RMS & SNR estimation (post-HPF / post-notch)
+    # Measuring noise_floor_rms after removing out-of-band <120Hz rumble and hum prevents
+    # downstream noise_bounded_agc and pre-gating from misclassifying stripped rumble as in-band hiss.
+    cond_samples = butterworth_highpass(samples, cutoff_hz=hpf_cutoff, order=4)
+    if notch_freqs:
+        cond_samples = harmonic_notch_filter(cond_samples, freqs=notch_freqs, bw_hz=6.0)
+
+    if n_frames > 0:
+        frames = cond_samples[:n_frames * frame_len].reshape(n_frames, frame_len)
+        frame_rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+        active_rms = frame_rms[frame_rms > 1e-6]
+        if len(active_rms) >= 4:
+            noise_floor = float(np.percentile(active_rms, 15))
+            p95_rms = float(np.percentile(active_rms, 95))
+            # Capture sparse short utterances (<5% duty cycle) via top sustained frames (~0.4s)
+            top_k = min(len(active_rms), max(2, min(8, len(active_rms) // 8)))
+            sustained_peak = float(np.mean(np.sort(active_rms)[-top_k:]))
+            peak_rms = max(p95_rms, sustained_peak)
+        else:
+            noise_floor = float(np.percentile(frame_rms, 15))
+            peak_rms = float(np.percentile(frame_rms, 95))
+    else:
+        noise_floor = float(np.sqrt(np.mean(cond_samples ** 2) + 1e-12))
+        peak_rms = noise_floor
+
+    snr_db = float(20.0 * np.log10(max(peak_rms, 1e-6) / max(noise_floor, 1e-6)))
+
+    # Update speech fraction on conditioned spectrum if heavy rumble was stripped
+    if rumble_frac >= 0.40:
+        cond_spec = cond_samples[:spec_dur]
+        cond_mag2 = np.abs(np.fft.rfft(cond_spec)) ** 2
+        speech_frac = float(np.sum(cond_mag2[(freqs >= 300.0) & (freqs <= 3200.0)])) / (float(np.sum(cond_mag2)) + 1e-12)
+
+    # 6. Formant boost calculation
     if snr_db >= 18.0 and speech_frac >= 0.35:
         formant_boost = 0.0
         reasoning.append(f"Clean speech detected (SNR={snr_db:.1f}dB, speech={speech_frac*100:.1f}%); formant boost bypassed to avoid distortion.")
@@ -775,12 +1040,11 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
         formant_boost = float(np.clip(3.5 - (snr_db - 5.0) * 0.2, 1.0, 4.0))
         reasoning.append(f"Moderate noise floor (SNR={snr_db:.1f}dB); formant band boosted by +{formant_boost:.1f} dB.")
 
-    # 6. Adaptive transducer blank penalty
+    # 7. Adaptive transducer blank penalty (Rule 4: 0.30 - 1.05)
     blank_penalty = float(np.clip(0.55 + (8.0 - snr_db) * 0.03, 0.3, 1.05))
     reasoning.append(f"Transducer blank penalty dynamically tuned to {blank_penalty:.2f} based on estimated SNR ({snr_db:.1f} dB).")
 
-    # 7. Dynamic speech-band pre-gate threshold
-    # Measure speech band RMS in quiet frames
+    # 8. Dynamic speech-band pre-gate threshold
     if n_frames > 0:
         quiet_indices = np.argsort(frame_rms)[:max(1, n_frames // 5)]
         quiet_samples = frames[quiet_indices].flatten()
@@ -790,7 +1054,7 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
     pregate_threshold = float(max(1e-5, speech_floor * 0.25))
     reasoning.append(f"Dynamic speech-band pre-gate threshold synthesized at {pregate_threshold:.6f} (silence gate at 0.25x quiet-band floor).")
 
-    # 8. Adaptive windowing
+    # 9. Adaptive windowing
     if dur <= 25.0:
         win_sec, step_sec = 5.0, 1.25
     elif dur <= 120.0:
@@ -800,6 +1064,7 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
 
     return AcousticProfile(
         noise_floor_rms=noise_floor,
+        raw_noise_floor_rms=raw_noise_floor,
         peak_rms=peak_rms,
         snr_db=snr_db,
         hum_freq=hum_freq,
@@ -816,6 +1081,27 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
     )
 
 
+def _exp1_approx(v: np.ndarray) -> np.ndarray:
+    """Pure-NumPy Abramowitz & Stegun (5.1.53 / 5.1.56) approximation of E_1(v)."""
+    v_safe = np.clip(v, 1e-7, 40.0)
+    out = np.empty_like(v_safe, dtype=np.float32)
+    low = v_safe <= 1.0
+    if np.any(low):
+        vl = v_safe[low]
+        out[low] = (
+            -np.log(vl)
+            - 0.57721566
+            + vl * (0.99999193 + vl * (-0.24991055 + vl * (0.05519968 + vl * (-0.00976004 + vl * 0.00107857))))
+        )
+    high = ~low
+    if np.any(high):
+        vh = v_safe[high]
+        num = vh * vh + 2.334733 * vh + 0.250621
+        den = vh * vh + 3.330657 * vh + 1.681534
+        out[high] = (np.exp(-vh) / vh) * (num / den)
+    return np.maximum(out, 0.0)
+
+
 def adaptive_spectral_gate(
     samples: np.ndarray,
     sr: int = SR,
@@ -824,10 +1110,11 @@ def adaptive_spectral_gate(
     g_floor_db: float = -20.0,
     alpha_dd: float = 0.96,
 ) -> np.ndarray:
-    """Pure-NumPy Decision-Directed Wiener Filter with Leaky Minimum Statistics Noise Tracking.
+    """Pure-NumPy Ephraim-Malah Log-MMSE Spectral Estimator with SPP-Modulated MCRA Noise Tracking.
 
-    Tracks the stationary noise floor per STFT bin and applies a smooth, musical-noise-free
-    gain mask using the Ephraim-Malah decision-directed a priori SNR estimator.
+    Initializes the stationary noise PSD from the 20th-percentile non-faded frames (preventing both
+    Tukey-fade zero poisoning and t=0 speech poisoning) and applies Log-MMSE gain to preserve
+    sub-noise speech formants without musical noise.
     """
     if len(samples) < win_len:
         return samples.copy().astype(np.float32)
@@ -850,44 +1137,64 @@ def adaptive_spectral_gate(
     frames_idx = np.arange(win_len)[None, :] + np.arange(n_frames)[:, None] * hop_len
     frames = samples_padded[frames_idx] * window
     stft = np.fft.rfft(frames, axis=1)  # Shape: (n_frames, n_bins)
-    mag2 = np.abs(stft) ** 2
-    n_bins = stft.shape[1]
+    mag = np.abs(stft)
+    mag2 = mag ** 2
 
-    # 2. Minimum Statistics Noise Floor Tracking
-    noise_psd = np.mean(mag2[:min(5, n_frames)], axis=0)
+    # 2. Unbiased Minimum-Frame Noise PSD Initialization on non-zero / non-faded frames
+    # Selecting the quietest valid frames by total frame power and taking the per-bin mean
+    # avoids the 4.5x (-6.5 dB) downward bias of per-bin P20 on exponential STFT power.
+    frame_power = np.mean(mag2, axis=1)
+    max_fp = float(np.max(frame_power)) if len(frame_power) > 0 else 0.0
+    valid_idx = np.where(frame_power > max(1e-12, max_fp * 1e-4))[0]
+    if len(valid_idx) > 0:
+        valid_powers = frame_power[valid_idx]
+        n_quiet = max(1, int(np.ceil(0.30 * len(valid_idx))))
+        quiet_order = np.argsort(valid_powers)[:n_quiet]
+        noise_psd = np.maximum(np.mean(mag2[valid_idx[quiet_order]], axis=0), 1e-12).astype(np.float32)
+    else:
+        noise_psd = np.maximum(np.mean(mag2, axis=0), 1e-12).astype(np.float32)
+
+    # Also keep smoothed prior PSD initialized properly
     smooth_power = noise_psd.copy()
-
-    prior_s_mag = np.abs(stft[0])
+    prior_s_mag2 = (noise_psd * 0.25).copy()
     out_stft = np.zeros_like(stft)
 
-    beta_rise = 0.003
-    beta_fall = 0.15
+    beta_rise = 0.006
+    beta_fall = 0.14
     alpha_p = 0.80
 
     for m in range(n_frames):
         cur_mag2 = mag2[m]
         smooth_power = alpha_p * smooth_power + (1.0 - alpha_p) * cur_mag2
 
-        # Asymmetric update of noise floor
+        # SPP-modulated MCRA update: freeze upward drift on likely speech bins (>2.5x noise mean)
+        sr_ratio = smooth_power / np.maximum(noise_psd, 1e-12)
+        p_speech = np.clip((sr_ratio - 2.2) / 3.5, 0.0, 1.0)
+        alpha_d = (1.0 - p_speech) * beta_rise
+
         mask_rise = smooth_power > noise_psd
-        noise_psd[mask_rise] += beta_rise * (smooth_power[mask_rise] - noise_psd[mask_rise])
+        noise_psd[mask_rise] += alpha_d[mask_rise] * (smooth_power[mask_rise] - noise_psd[mask_rise])
         noise_psd[~mask_rise] += beta_fall * (smooth_power[~mask_rise] - noise_psd[~mask_rise])
         noise_psd = np.maximum(noise_psd, 1e-12)
 
         # 3. Decision-Directed A Priori SNR
-        post_snr = cur_mag2 / noise_psd
-        prior_snr = alpha_dd * ((prior_s_mag ** 2) / noise_psd) + (1.0 - alpha_dd) * np.maximum(post_snr - 1.0, 0.0)
+        post_snr = np.minimum(cur_mag2 / noise_psd, 1000.0)
+        prior_snr = alpha_dd * (prior_s_mag2 / noise_psd) + (1.0 - alpha_dd) * np.maximum(post_snr - 1.0, 0.0)
+        prior_snr = np.maximum(prior_snr, 1e-6)
 
-        # 4. Wiener Gain calculation
-        gain = prior_snr / (1.0 + prior_snr)
+        # 4. Ephraim-Malah Log-MMSE Gain
+        xi_term = prior_snr / (1.0 + prior_snr)
+        v = xi_term * post_snr
+        gain = xi_term * np.exp(0.5 * np.minimum(_exp1_approx(v), 12.0))
+        gain = np.minimum(gain, 1.0)
 
         # Inter-bin smoothing to eliminate isolated musical noise tones
         gain_smooth = np.convolve(gain, [0.20, 0.60, 0.20], mode="same")
-        gain_bounded = np.maximum(gain_smooth, g_floor)
+        gain_bounded = np.clip(gain_smooth, g_floor, 1.0)
 
-        s_mag = gain_bounded * np.abs(stft[m])
-        prior_s_mag = s_mag
-        out_stft[m] = s_mag * np.exp(1j * np.angle(stft[m]))
+        s_mag = gain_bounded * mag[m]
+        prior_s_mag2 = s_mag ** 2
+        out_stft[m] = stft[m] * gain_bounded
 
     # 5. Overlap-Add Time Domain Synthesis
     synth_frames = np.fft.irfft(out_stft, axis=1) * window
@@ -914,62 +1221,79 @@ def harmonic_pitch_vad(
     nccf_threshold: float = 0.40,
     hcr_threshold: float = 3.0,
 ) -> np.ndarray:
-    """Detect faint voiced speech buried in severe noise using Cauchy-Schwarz NCCF autocorrelation and HPS.
+    """Detect faint voiced speech buried in severe noise using exact Cauchy-Schwarz NCCF and high-res HPS.
 
-    Automatically removes electrical hum harmonics (50/60 Hz) and sub-80Hz rumble before pitch tracking.
-    Returns a boolean array of speech activity per frame (hop_sec resolution).
+    Conditions signal to the vocal pitch + low-formant band (70 - 1200 Hz) without destructive
+    high-pass pre-emphasis, removes 50/60 Hz hum, and computes exact unwindowed normalized
+    cross-correlation (bound = 1.0) plus 2048-point zero-padded Harmonic Product Spectrum.
     """
     if len(samples) == 0:
         return np.array([False], dtype=bool)
 
-    # 1. Conditioning: remove sub-80Hz rumble and electrical hum harmonics
-    filtered = butterworth_highpass(samples, cutoff_hz=80.0)
-    prof = profile_audio(filtered)
+    # 1. Conditioning: remove sub-70Hz rumble, electrical hum, and >1200Hz broadband hiss
+    filtered = butterworth_highpass(samples, cutoff_hz=max(65.0, f0_min - 5.0))
+    prof = profile_audio(samples)
     if prof.notch_freqs:
         filtered = harmonic_notch_filter(filtered, freqs=prof.notch_freqs)
 
+    if len(filtered) >= 64:
+        n_orig = len(filtered)
+        pad_len = min(n_orig, sr // 4)
+        fp = np.pad(filtered - float(np.mean(filtered)), pad_len, mode="reflect")
+        f_fft = np.fft.rfft(fp)
+        f_hz = np.fft.rfftfreq(len(fp), 1.0 / sr)
+        lp_mask = np.ones_like(f_hz, dtype=np.float32)
+        trans = (f_hz > 1100.0) & (f_hz < 1500.0)
+        lp_mask[trans] = 0.5 * (1.0 + np.cos(np.pi * (f_hz[trans] - 1100.0) / 400.0))
+        lp_mask[f_hz >= 1500.0] = 0.0
+        pitch_band = np.fft.irfft(f_fft * lp_mask, n=len(fp))[pad_len : pad_len + n_orig].astype(np.float32)
+    else:
+        pitch_band = filtered.astype(np.float32)
+
     frame_len = int(frame_sec * sr)
     hop_len = int(hop_sec * sr)
-    n_frames = 1 + (len(filtered) - frame_len) // hop_len
+    n_frames = 1 + (len(pitch_band) - frame_len) // hop_len
     if n_frames <= 0:
         return np.array([False], dtype=bool)
 
-    lag_min = int(sr / f0_max)
+    lag_min = max(1, int(sr / f0_max))
     lag_max = int(sr / f0_min)
 
     speech_active = np.zeros(n_frames, dtype=bool)
-
-    # Pre-emphasis to flatten glottal spectral tilt and accentuate higher harmonics
-    hp_in = filtered[1:] - 0.95 * filtered[:-1]
-    hp_in = np.pad(hp_in, (1, 0))
-
     window = np.hanning(frame_len).astype(np.float32)
+    n_fft_corr = 1
+    while n_fft_corr < frame_len + lag_max + 1:
+        n_fft_corr *= 2
 
     for i in range(n_frames):
         s_idx = i * hop_len
-        chunk = hp_in[s_idx : s_idx + frame_len]
+        chunk_raw = filtered[s_idx : s_idx + frame_len]
+        chunk = pitch_band[s_idx : s_idx + frame_len]
+        if len(chunk) < frame_len:
+            continue
 
         c_rms = float(np.sqrt(np.mean(chunk ** 2) + 1e-12))
         if c_rms < 1e-5:
             continue
 
         ext_len = frame_len + lag_max
-        if s_idx + ext_len > len(hp_in):
-            continue
-        ext_chunk = hp_in[s_idx : s_idx + ext_len]
+        if s_idx + ext_len > len(pitch_band):
+            ext_chunk = np.pad(pitch_band[s_idx:], (0, ext_len - (len(pitch_band) - s_idx)))
+        else:
+            ext_chunk = pitch_band[s_idx : s_idx + ext_len]
 
-        # Normalized cross-correlation
-        n_fft = 1024
-        fft_c = np.fft.rfft(chunk * window, n=n_fft)
-        fft_ext = np.fft.rfft(ext_chunk[:n_fft], n=n_fft)
-        corr = np.fft.irfft(fft_ext * np.conj(fft_c), n=n_fft)
-
-        chunk_e = float(np.sum((chunk * window) ** 2))
-        if chunk_e < 1e-8:
+        # Symmetric unwindowed zero-mean Cauchy-Schwarz NCCF (attains 1.0 on periodic signal)
+        c0 = chunk - float(np.mean(chunk))
+        ext0 = ext_chunk - float(np.mean(ext_chunk[:frame_len]))
+        chunk_e = float(np.sum(c0 ** 2))
+        if chunk_e < 1e-10:
             continue
 
-        # Exact Cauchy-Schwarz normalized cross correlation
-        cum_sq = np.concatenate(([0.0], np.cumsum(ext_chunk ** 2)))
+        fft_c = np.fft.rfft(c0, n=n_fft_corr)
+        fft_ext = np.fft.rfft(ext0, n=n_fft_corr)
+        corr = np.fft.irfft(fft_ext * np.conj(fft_c), n=n_fft_corr)
+
+        cum_sq = np.concatenate(([0.0], np.cumsum(ext0 ** 2)))
         del_idx = np.arange(lag_min, lag_max + 1)
         del_e = cum_sq[del_idx + frame_len] - cum_sq[del_idx]
         denom = np.sqrt(chunk_e * np.maximum(del_e, 1e-12))
@@ -977,23 +1301,33 @@ def harmonic_pitch_vad(
         lags_corr = corr[lag_min : lag_max + 1]
         nccf_max = float(np.max(lags_corr / denom))
 
-        # Harmonic Product Spectrum
-        mag = np.abs(np.fft.rfft(chunk * window, n=512))
-        n_pts = len(mag) // 4
-        if n_pts > 0:
-            hps = mag[:n_pts] * mag[::2][:n_pts] * mag[::3][:n_pts] * mag[::4][:n_pts]
-            hcr = float(np.max(hps)) / float(np.median(hps) + 1e-12)
+        # High-resolution 2048-point zero-padded Harmonic Product Spectrum (7.8 Hz/bin)
+        mag = np.abs(np.fft.rfft((chunk_raw - float(np.mean(chunk_raw))) * window, n=2048))
+        max_h = 3 if len(mag) >= 2048 else 2
+        n_pts = len(mag) // max_h
+        min_bin = max(1, int(f0_min * 2048 / sr))
+        max_bin = min(n_pts, int(f0_max * 2048 / sr) + 1)
+        if max_bin > min_bin + 2:
+            hps = mag[:n_pts].copy()
+            for h in range(2, max_h + 1):
+                hps *= mag[::h][:n_pts]
+            hps_roi = hps[min_bin:max_bin]
+            hcr = float(np.max(hps_roi)) / float(np.median(hps_roi) + 1e-12)
         else:
             hcr = 1.0
 
-        if nccf_max >= nccf_threshold and hcr >= hcr_threshold:
+        if (nccf_max >= nccf_threshold and hcr >= hcr_threshold) or nccf_max >= (nccf_threshold + 0.22):
             speech_active[i] = True
 
     # Median filter smoothing (3 frames ~ 30ms) to suppress isolated transient spikes
     if len(speech_active) >= 3:
         smoothed = speech_active.copy()
         for i in range(1, len(speech_active) - 1):
-            smoothed[i] = (speech_active[i-1] and speech_active[i]) or (speech_active[i] and speech_active[i+1]) or (speech_active[i-1] and speech_active[i+1])
+            smoothed[i] = (
+                (speech_active[i - 1] and speech_active[i])
+                or (speech_active[i] and speech_active[i + 1])
+                or (speech_active[i - 1] and speech_active[i + 1])
+            )
         speech_active = smoothed
 
     return speech_active
@@ -1005,8 +1339,10 @@ def multiband_formant_agc(
     target_formant_rms: float = 0.12,
     max_noise_boost_db: float = 6.0,
 ) -> np.ndarray:
-    """Zero-phase 3-band dynamic range equalizer that lifts faint speech formants
-    without amplifying sub-rumble or expanding background pause hiss.
+    """Zero-phase 3-band dynamic range equalizer with envelope-gated formant expansion.
+
+    Lifts faint speech formants (140 - 3400 Hz) and consonant fricatives (3400 - 7500 Hz)
+    while strictly bounding stationary background hiss amplification.
     """
     if len(samples) == 0:
         return samples.copy().astype(np.float32)
@@ -1020,9 +1356,6 @@ def multiband_formant_agc(
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
 
     # 1. Band Mask Construction (Smooth Raised-Cosine Crossovers)
-    # Band 1: 0 - 140 Hz (Rumble)
-    # Band 2: 140 - 3400 Hz (Speech Formants)
-    # Band 3: 3400 - 7500 Hz (Consonant Fricatives)
     mask_b1 = np.zeros_like(freqs)
     mask_b2 = np.zeros_like(freqs)
     mask_b3 = np.zeros_like(freqs)
@@ -1046,25 +1379,59 @@ def multiband_formant_agc(
     sig_b2 = np.fft.irfft(fft * mask_b2, n=n_fft)[pad_len : pad_len + n]
     sig_b3 = np.fft.irfft(fft * mask_b3, n=n_fft)[pad_len : pad_len + n]
 
-    # 3. Dynamic Gain Calculation per Band
-    # Band 1 (Rumble): strictly attenuate or unity (never gain)
+    # 3. Speech-Aware Envelope & Spectral Structure Gating
     g1 = 0.25
+    max_bg_linear = 10.0 ** (max_noise_boost_db / 20.0)
 
-    # Band 2 (Core Formants): Speech-aware bounded gain
-    p90_b2 = float(np.percentile(np.abs(sig_b2), 90))
-    floor_b2 = float(np.percentile(np.abs(sig_b2), 15))
+    # Measure spectral flatness in core formant band (180 - 3000 Hz)
+    b2_bins = (freqs >= 180.0) & (freqs <= 3000.0)
+    if np.any(b2_bins):
+        b2_pow = (np.abs(fft[b2_bins]) ** 2) + 1e-12
+        flatness_b2 = float(np.exp(np.mean(np.log(b2_pow))) / np.mean(b2_pow))
+    else:
+        flatness_b2 = 0.5
 
-    desired_g2 = (target_formant_rms * 1.5) / max(p90_b2, 1e-5)
-    noise_cap_g2 = 10.0 ** (max_noise_boost_db / 20.0) * (floor_b2 / max(floor_b2, 1e-5))
-    g2 = float(np.clip(desired_g2, 1.0, min(18.0, max(1.0, noise_cap_g2 * 4.0))))
+    frame_len = max(64, int(0.020 * sr))
+    n_fr = n // frame_len
+    if n_fr >= 2:
+        fr_b2 = np.sqrt(np.mean(sig_b2[: n_fr * frame_len].reshape(n_fr, frame_len) ** 2, axis=1) + 1e-12)
+        floor_b2 = float(np.percentile(fr_b2, 15))
+        peak_b2 = float(np.percentile(fr_b2, 92))
+        mod_ratio = peak_b2 / max(floor_b2, 1e-6)
 
-    # Band 3 (Consonants): Gentle consonant articulation lift
+        # Stationary broadband hiss (high flatness + near-unit envelope modulation): cap near unity
+        is_stationary_hiss = (flatness_b2 > 0.35) and (mod_ratio < 1.35)
+        bg_cap = 1.20 if is_stationary_hiss else min(max_bg_linear, max(1.0, 0.030 / max(floor_b2, 1e-5)))
+
+        desired_peak_g2 = target_formant_rms / max(peak_b2, 1e-5)
+        if is_stationary_hiss:
+            g2_vec = np.full(n, float(np.clip(desired_peak_g2, 1.0, bg_cap)), dtype=np.float32)
+        elif flatness_b2 < 0.22 and mod_ratio < 1.35:
+            # Sustained tonal formant (e.g. steady vowel): lift smoothly up to tonal cap
+            g2_scalar = float(np.clip(desired_peak_g2, 1.0, min(8.0, max_bg_linear * 2.5)))
+            g2_vec = np.full(n, g2_scalar, dtype=np.float32)
+        else:
+            # Modulated speech in noise: keep pause floor <= bg_cap, expand active syllables upward
+            speech_cap = min(12.0, max(bg_cap, bg_cap * 2.75))
+            peak_gain = float(np.clip(desired_peak_g2, 1.0, speech_cap))
+            floor_gain = float(np.clip(desired_peak_g2, 1.0, bg_cap))
+            snr_fr = np.clip((fr_b2 / max(floor_b2, 1e-6) - 1.15) / 1.35, 0.0, 1.0)
+            fr_gain = floor_gain + snr_fr * max(0.0, peak_gain - floor_gain)
+            # Smooth frame gain across 3 frames (~60ms) and interpolate to sample rate
+            if len(fr_gain) >= 3:
+                fr_gain = np.convolve(fr_gain, [0.25, 0.50, 0.25], mode="same")
+            centers = (np.arange(n_fr, dtype=np.float32) + 0.5) * frame_len
+            g2_vec = np.interp(np.arange(n, dtype=np.float32), centers, fr_gain).astype(np.float32)
+    else:
+        rms_b2 = float(np.sqrt(np.mean(sig_b2 ** 2) + 1e-12))
+        g2_vec = np.full(n, float(np.clip(target_formant_rms / max(rms_b2, 1e-5), 1.0, max_bg_linear)), dtype=np.float32)
+
     p90_b3 = float(np.percentile(np.abs(sig_b3), 90))
     desired_g3 = (target_formant_rms * 0.8) / max(p90_b3, 1e-5)
-    g3 = float(np.clip(desired_g3, 1.0, min(8.0, g2 * 0.75)))
+    g3_vec = np.clip(np.minimum(desired_g3, g2_vec * 0.75), 1.0, 6.0).astype(np.float32)
 
     # 4. Soft Saturation Synthesis
-    out_linear = (sig_b1 * g1) + (sig_b2 * g2) + (sig_b3 * g3)
+    out_linear = (sig_b1 * g1) + (sig_b2 * g2_vec) + (sig_b3 * g3_vec)
 
     peak = float(np.max(np.abs(out_linear)))
     if peak > 0.75:
@@ -1094,26 +1461,36 @@ def suppress_impulsive_clicks(
     d2 = np.zeros(n, dtype=np.float32)
     d2[1:-1] = np.abs(out[2:] - 2.0 * out[1:-1] + out[:-2])
 
+    # Compute active global curvature scale so codec-gated digital-zero blocks (MAD=0)
+    # cannot trigger false outlier erasures on consonant release bursts at speech onset.
+    nonzero_d2 = d2[d2 > 1e-7]
+    if len(nonzero_d2) >= 16:
+        g_med = float(np.median(nonzero_d2))
+        active_global_scale = 1.4826 * float(np.median(np.abs(nonzero_d2 - g_med)))
+    else:
+        active_global_scale = 1e-4
+    scale_floor = max(0.08 * active_global_scale, 1e-5)
+
     block_len = 256
     n_blocks = n // block_len
     if n_blocks > 0:
         blocks = d2[: n_blocks * block_len].reshape(n_blocks, block_len)
         med_b = np.median(blocks, axis=1)
-        mad_b = np.median(np.abs(blocks - med_b[:, None]), axis=1) + 1e-8
+        mad_b = np.median(np.abs(blocks - med_b[:, None]), axis=1)
 
-        local_scale = np.repeat(1.4826 * mad_b, block_len)
+        local_scale = np.maximum(np.repeat(1.4826 * mad_b, block_len), scale_floor)
         local_med = np.repeat(med_b, block_len)
 
         rem = n - len(local_scale)
         if rem > 0:
-            local_scale = np.pad(local_scale, (0, rem), mode='edge')
-            local_med = np.pad(local_med, (0, rem), mode='edge')
+            local_scale = np.pad(local_scale, (0, rem), mode="edge")
+            local_med = np.pad(local_med, (0, rem), mode="edge")
 
         z_scores = np.abs(d2 - local_med) / local_scale
     else:
-        med = np.median(d2)
-        mad = np.median(np.abs(d2 - med)) + 1e-8
-        z_scores = np.abs(d2 - med) / (1.4826 * mad)
+        med = float(np.median(d2))
+        mad = float(np.median(np.abs(d2 - med)))
+        z_scores = np.abs(d2 - med) / max(1.4826 * mad, scale_floor)
 
     outliers = z_scores > threshold_sigma
     if not np.any(outliers):
@@ -1305,6 +1682,207 @@ def detect_formant_modulation_spans(
     return merged
 
 
+def compute_speech_presence_prob(
+    samples: np.ndarray,
+    denoised: np.ndarray | None = None,
+    sr: int = SR,
+    hop_sec: float = 0.020,
+    win_sec: float = 0.032,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Multi-cue Speech Presence Probability (SPP) detector for sub-noise & background speech.
+
+    Combines 4 pure-NumPy acoustic cues at `hop_sec` resolution (default 20ms = 50 Hz):
+      1. Post-denoiser emergence (or Log-MMSE proxy) relative to local P15 floor.
+      2. 2-8 Hz syllabic log-envelope modulation index (1.5s sliding window).
+      3. Formant-band (300-3400 Hz) spectral structure (1 - spectral flatness).
+      4. Low-band (70-900 Hz) harmonic periodicity peak.
+
+    Returns:
+      (spp, local_snr_db, local_floor_rms) each of shape (n_frames,).
+    """
+    win_len = max(128, int(win_sec * sr))
+    hop_len = max(64, int(hop_sec * sr))
+    if len(samples) < win_len:
+        z = np.zeros(1, dtype=np.float32)
+        return z, z - 20.0, z + 1e-5
+
+    n_frames = 1 + (len(samples) - win_len) // hop_len
+    frames_idx = np.arange(win_len)[None, :] + np.arange(n_frames)[:, None] * hop_len
+    window = np.hanning(win_len).astype(np.float32)
+
+    raw_frames = samples[frames_idx]
+    stft = np.fft.rfft(raw_frames * window, axis=1)
+    mag2 = (np.abs(stft) ** 2) + 1e-12
+    freqs = np.fft.rfftfreq(win_len, 1.0 / sr)
+
+    formant_bins = (freqs >= 300.0) & (freqs <= 3400.0)
+    if not np.any(formant_bins):
+        formant_bins = slice(None)
+
+    formant_pow = mag2[:, formant_bins]
+    raw_formant_rms = np.sqrt(np.mean(formant_pow, axis=1))
+
+    # Cue 3: Formant spectral structure (tonal/harmonic peaks vs flat Gaussian hiss)
+    geo_mean = np.exp(np.mean(np.log(formant_pow), axis=1))
+    arith_mean = np.mean(formant_pow, axis=1) + 1e-12
+    flatness = geo_mean / arith_mean
+    # White noise in Hann STFT has frame flatness ~0.55; formant ridges drop to 0.05-0.38
+    cue_structure = np.clip((0.50 - flatness) / 0.28, 0.0, 1.0).astype(np.float32)
+
+    # Local background floor over ~6s sliding context (P15 of raw formant RMS)
+    ctx_half = max(4, int(3.0 / hop_sec))
+    local_floor = np.empty(n_frames, dtype=np.float32)
+    stride = max(1, ctx_half // 4)
+    ctrl_idx = np.arange(0, n_frames, stride)
+    ctrl_vals = np.empty(len(ctrl_idx), dtype=np.float32)
+    for k, m in enumerate(ctrl_idx):
+        lo = max(0, m - ctx_half)
+        hi = min(n_frames, m + ctx_half + 1)
+        sub = raw_formant_rms[lo:hi]
+        nz = sub[sub > 1e-7]
+        ctrl_vals[k] = float(np.percentile(nz, 15)) if len(nz) >= 3 else float(np.percentile(sub, 15))
+    local_floor = np.interp(np.arange(n_frames, dtype=np.float32), ctrl_idx.astype(np.float32), ctrl_vals).astype(np.float32)
+    local_floor = np.maximum(local_floor, 1e-6)
+    local_snr_db = (20.0 * np.log10(np.maximum(raw_formant_rms, 1e-7) / local_floor)).astype(np.float32)
+
+    # Cue 1: Post-denoiser emergence (neural denoiser suppresses stationary noise by 15-30 dB
+    # while leaving buried speech islands at 3x-20x the denoised floor)
+    if denoised is not None and len(denoised) >= len(samples):
+        den_frames = denoised[: len(samples)][frames_idx]
+        den_stft = np.fft.rfft(den_frames * window, axis=1)
+        den_pow = (np.abs(den_stft[:, formant_bins]) ** 2) + 1e-12
+        den_rms = np.sqrt(np.mean(den_pow, axis=1))
+        den_ctrl = np.empty(len(ctrl_idx), dtype=np.float32)
+        for k, m in enumerate(ctrl_idx):
+            lo = max(0, m - ctx_half)
+            hi = min(n_frames, m + ctx_half + 1)
+            den_ctrl[k] = float(np.percentile(den_rms[lo:hi], 20))
+        den_floor = np.maximum(
+            np.interp(np.arange(n_frames, dtype=np.float32), ctrl_idx.astype(np.float32), den_ctrl),
+            1e-6,
+        )
+        den_ratio_db = 20.0 * np.log10(np.maximum(den_rms, 1e-7) / den_floor)
+        cue_den = np.clip((den_ratio_db - 2.5) / 9.5, 0.0, 1.0).astype(np.float32)
+    else:
+        cue_den = np.clip((local_snr_db + 1.5) / 8.0, 0.0, 1.0).astype(np.float32)
+
+    # Cue 2: 2-8 Hz syllabic modulation of log-formant envelope over 1.28s windows (64 frames @ 50Hz)
+    env_fps = 1.0 / hop_sec
+    log_env = np.log(raw_formant_rms + 1e-6)
+    mod_win = min(n_frames, max(16, int(1.28 * env_fps)))
+    cue_mod = np.zeros(n_frames, dtype=np.float32)
+    if n_frames >= 16:
+        mod_step = max(1, mod_win // 4)
+        mod_freqs = np.fft.rfftfreq(mod_win, hop_sec)
+        syl_mask = (mod_freqs >= 2.0) & (mod_freqs <= 8.0)
+        rest_mask = (mod_freqs >= 0.8) & ~syl_mask
+        if np.any(syl_mask):
+            w_mod = np.hanning(mod_win).astype(np.float32)
+            acc = np.zeros(n_frames, dtype=np.float32)
+            cnt = np.zeros(n_frames, dtype=np.float32)
+            for s in range(0, max(1, n_frames - mod_win + 1), mod_step):
+                seg = log_env[s : s + mod_win]
+                if len(seg) < mod_win:
+                    break
+                seg0 = (seg - float(np.mean(seg))) * w_mod
+                mp = (np.abs(np.fft.rfft(seg0)) ** 2) + 1e-12
+                e_syl = float(np.mean(mp[syl_mask]))
+                e_rest = float(np.mean(mp[rest_mask])) if np.any(rest_mask) else 1e-6
+                # Also require minimal envelope variance so pure digital silence doesn't score high
+                env_std = float(np.std(seg))
+                ratio = (e_syl / max(e_rest, 1e-8)) * min(1.0, env_std / 0.14)
+                val = float(np.clip((ratio - 1.15) / 2.0, 0.0, 1.0))
+                acc[s : s + mod_win] += val
+                cnt[s : s + mod_win] += 1.0
+            valid_c = cnt > 0
+            cue_mod[valid_c] = acc[valid_c] / cnt[valid_c]
+
+    # Cue 4: Vectorized low-band (80-900 Hz) autocorrelation periodicity
+    pitch_bins = (freqs >= 80.0) & (freqs <= 900.0)
+    low_stft = np.zeros_like(stft)
+    low_stft[:, pitch_bins] = stft[:, pitch_bins]
+    acorr = np.fft.irfft(np.abs(low_stft) ** 2, n=win_len, axis=1)
+    lag_lo = max(1, int(sr / 340.0))
+    lag_hi = min(win_len // 2, int(sr / 75.0))
+    if lag_hi > lag_lo:
+        r0 = np.maximum(acorr[:, 0], 1e-12)
+        peak_r = np.max(acorr[:, lag_lo:lag_hi], axis=1) / r0
+        cue_pitch = np.clip((peak_r - 0.28) / 0.35, 0.0, 1.0).astype(np.float32)
+    else:
+        cue_pitch = np.zeros(n_frames, dtype=np.float32)
+
+    spp = (0.42 * cue_den + 0.24 * cue_mod + 0.19 * cue_structure + 0.15 * cue_pitch).astype(np.float32)
+    if n_frames >= 5:
+        spp = np.convolve(spp, [0.15, 0.20, 0.30, 0.20, 0.15], mode="same").astype(np.float32)
+    return np.clip(spp, 0.0, 1.0), local_snr_db, local_floor
+
+
+def find_subnoise_speech_spans(
+    samples: np.ndarray,
+    denoised: np.ndarray | None = None,
+    sr: int = SR,
+    spp_threshold: float = 0.36,
+    min_dur_sec: float = 0.35,
+    merge_gap_sec: float = 0.90,
+    pad_sec: float = 0.45,
+) -> list[dict]:
+    """Locate candidate speech islands (including sub-noise-floor background speech) via 4-cue SPP.
+
+    Returns list of dicts with keys:
+      start_sec, end_sec, peak_spp, mean_spp, local_snr_db, local_floor_rms
+    """
+    hop_sec = 0.020
+    dur_sec = len(samples) / sr
+    if dur_sec < min_dur_sec:
+        return []
+
+    spp, snr_frames, floor_frames = compute_speech_presence_prob(samples, denoised=denoised, sr=sr, hop_sec=hop_sec)
+    active = spp >= spp_threshold
+    if not np.any(active):
+        return []
+
+    raw_spans: list[tuple[int, int]] = []
+    in_span = False
+    s_fr = 0
+    for idx, flag in enumerate(active):
+        if flag and not in_span:
+            s_fr = idx
+            in_span = True
+        elif not flag and in_span:
+            raw_spans.append((s_fr, idx))
+            in_span = False
+    if in_span:
+        raw_spans.append((s_fr, len(active)))
+
+    merge_frames = int(merge_gap_sec / hop_sec)
+    merged: list[tuple[int, int]] = []
+    for s_f, e_f in raw_spans:
+        if merged and (s_f - merged[-1][1]) <= merge_frames:
+            merged[-1] = (merged[-1][0], e_f)
+        else:
+            merged.append((s_f, e_f))
+
+    min_frames = max(2, int(min_dur_sec / hop_sec))
+    results: list[dict] = []
+    for s_f, e_f in merged:
+        if (e_f - s_f) < min_frames:
+            continue
+        span_spp = spp[s_f:e_f]
+        span_snr = snr_frames[s_f:e_f]
+        span_floor = floor_frames[s_f:e_f]
+        t0 = max(0.0, s_f * hop_sec - pad_sec)
+        t1 = min(dur_sec, e_f * hop_sec + pad_sec)
+        results.append({
+            "start_sec": round(t0, 3),
+            "end_sec": round(t1, 3),
+            "peak_spp": round(float(np.max(span_spp)), 3),
+            "mean_spp": round(float(np.mean(span_spp)), 3),
+            "local_snr_db": round(float(np.percentile(span_snr, 80)), 2),
+            "local_floor_rms": float(np.median(span_floor)),
+        })
+    return results
+
+
 class StreamingDeclicker:
     """Stateful, real-time streaming de-clicker for live microphone streams.
 
@@ -1337,7 +1915,12 @@ class StreamingDeclicker:
 
         clean_out = cleaned_composite[self.m : self.m + b_len]
 
-        self.tail = cleaned_composite[b_len : b_len + 2 * self.m]
+        # Preserve cleaned left context (already emitted) alongside raw un-emitted right margin
+        # so boundary clicks wait for true future context instead of one-sided edge extrapolation.
+        self.tail = np.concatenate([
+            cleaned_composite[b_len : b_len + self.m],
+            composite[b_len + self.m : b_len + 2 * self.m],
+        ])
 
         return clean_out.astype(np.float32)
 

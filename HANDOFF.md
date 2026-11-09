@@ -40,18 +40,21 @@ stt/
 └── ui.py            # Zero-dependency HTTP/SSE web interface with waveform seeking
 ```
 
-### Critical Innovations Implemented in This Session:
-1. **Adaptive Acoustic Profiler ([`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py))**:
-   - `profile_audio(samples)`: Evaluates 15th percentile noise floor, 95th percentile peak energy, power-grid hum prominence (50 Hz vs 60 Hz), low-frequency rumble fraction (<120 Hz), and speech-band formant energy (300–3200 Hz).
+### Critical Innovations Implemented in This System:
+1. **Adaptive Acoustic Profiler & Hum Notcher ([`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py))**:
+   - `profile_audio(samples)`: Evaluates 15th percentile noise floor, top-sustained peak energy, power-grid hum prominence (50 Hz vs 60 Hz on quiet frames up to 600 Hz), low-frequency rumble fraction (<120 Hz), and speech-band formant energy (300–3200 Hz).
    - Generates zero-phase Butterworth high-pass cutoff (80 Hz to 130 Hz).
-   - Injects harmonic notch filters (`60/120/180 Hz` or `50/100/150 Hz`) when hum prominence > 4.0x.
+   - Injects harmonic notch filters (`60/120/180/240/300/360/420/480/540/600 Hz` or `50/.../600 Hz`) when hum prominence > 4.0x.
    - Computes dynamic speech formant boost (+0.0 dB to +5.0 dB) and dynamic transducer blank penalty ($0.30$ to $1.05$).
-2. **Batched Stream Parallelization ([`stt/asr.py`](file:///C:/Users/o/Desktop/stt/stt/asr.py))**:
-   - `transcribe_batch(rec, chunks)`: Encodes and decodes multiple enhancement streams (`gtcrn`, `dpdfnet4`, `hpf`) in a single native `rec.decode_streams()` call, achieving a 2.7x–3.2x real-time speedup on CPU.
-3. **Automatic Subfloor Escalation ([`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py))**:
-   - When Silero VAD fails across levels 0 through 5 (due to low SNR or heavy rumble swamping), the pipeline automatically triggers subfloor recovery without requiring manual `--subnoise` flags.
-4. **Timeline Formatting ([`stt/cli.py`](file:///C:/Users/o/Desktop/stt/stt/cli.py))**:
-   - Every segment outputs with its exact audio timeline interval `[MM:SS.mmm -> MM:SS.mmm]` by default (toggleable via `--no-timestamps`).
+2. **4-Cue Speech Presence Probability & Ephraim-Malah Log-MMSE ([`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py))**:
+   - `compute_speech_presence_prob`: 50 Hz frame composite of post-denoiser emergence, 2-8 Hz syllabic modulation, formant spectral structure (1 - spectral flatness), and low-band periodicity.
+   - `adaptive_spectral_gate`: Rational Padé approximation of Log-MMSE with MCRA noise tracking.
+3. **Parallel Stream Decoding & CN-ROVER ([`stt/asr.py`](file:///C:/Users/o/Desktop/stt/stt/asr.py), [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py))**:
+   - `transcribe_batch` / `decode_streams`: Concurrently decodes 7 enhancement streams (`gtcrn`, `hybrid`, `blend`, `dp4`, `formant_agc`, `spec_gate`, `hp`).
+   - `cn_rover_fuse`: Time-synchronous Confusion Network ROVER with token-level confidence weighting and specialist single-stream recovery.
+4. **Dual-Layer & Gap Recovery with Burial Telemetry ([`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py))**:
+   - Recovers loud foreground speech AND scans untranscribed gaps for buried background speech.
+   - Computes and logs acoustic burial depth ($\Delta_{\text{floor}}$ and $\Delta_{\text{fg}}$) with timeline timestamps `[MM:SS.mmm -> MM:SS.mmm]`, exported to terminal, `--jsonl`, and Web UI.
 
 ---
 

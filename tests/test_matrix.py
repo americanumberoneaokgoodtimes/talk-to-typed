@@ -73,8 +73,10 @@ def test_run_matrix_mocked(monkeypatch):
         def decode_stream(self, st): pass
         def get_result(self, st): return "hello test utterance"
 
+    import sherpa_onnx
     from stt import asr, robust
     monkeypatch.setattr(asr, "get_offline", lambda *args, **kwargs: MockOfflineRec())
+    monkeypatch.setattr(sherpa_onnx.OnlineRecognizer, "from_transducer", lambda *args, **kwargs: MockOnlineRec())
     monkeypatch.setattr(robust, "subnoise_transcribe", lambda *args, **kwargs: [(0.2, 1.2, "hello test utterance")])
 
     res = matrix.run_matrix(sig, cfg, audio_path="mock.wav", threads=1)

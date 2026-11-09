@@ -18,14 +18,34 @@ def _resolve(cfg: dict, model: str | None, key: str) -> Path:
     return p
 
 
-def _files(d: Path) -> dict:
-    def pick(stem):
-        for suffix in (".int8.onnx", ".onnx"):
-            if (d / (stem + suffix)).exists():
-                return str(d / (stem + suffix))
-        raise FileNotFoundError(f"{stem}.onnx not found in {d}")
+def _has_joiner(d: Path) -> bool:
+    return (d / "joiner.int8.onnx").exists() or (d / "joiner.onnx").exists()
 
-    return dict(encoder=pick("encoder"), decoder=pick("decoder"), joiner=pick("joiner"), tokens=str(d / "tokens.txt"))
+
+def _pick_onnx(d: Path, stem: str) -> str:
+    for suffix in (".int8.onnx", ".onnx"):
+        if (d / (stem + suffix)).exists():
+            return str(d / (stem + suffix))
+    raise FileNotFoundError(f"{stem}.onnx not found in {d}")
+
+
+def _files(d: Path) -> dict:
+    return dict(
+        encoder=_pick_onnx(d, "encoder"),
+        decoder=_pick_onnx(d, "decoder"),
+        joiner=_pick_onnx(d, "joiner"),
+        tokens=str(d / "tokens.txt"),
+    )
+
+
+def _is_supported_asr_dir(d: Path) -> bool:
+    if not d.is_dir() or not (d / "tokens.txt").exists():
+        return False
+    if _has_joiner(d):
+        return True
+    if "cohere" in d.name.lower() and hasattr(sherpa_onnx.OfflineRecognizer, "from_cohere_transcribe"):
+        return (d / "encoder.int8.onnx").exists() or (d / "encoder.onnx").exists()
+    return False
 
 
 def _model_type(d: Path) -> str:
@@ -39,6 +59,7 @@ def _model_type(d: Path) -> str:
 
 _offline_cache: dict = {}
 _offline_cache_lock = threading.Lock()
+_MAX_OFFLINE_CACHE = 6
 
 
 def offline(
@@ -50,6 +71,13 @@ def offline(
     max_active_paths: int = 4,
 ):
     d = _resolve(cfg, model, "offline_model")
+    if not _has_joiner(d) and "cohere" in d.name.lower() and hasattr(sherpa_onnx.OfflineRecognizer, "from_cohere_transcribe"):
+        return sherpa_onnx.OfflineRecognizer.from_cohere_transcribe(
+            encoder=_pick_onnx(d, "encoder"),
+            decoder=_pick_onnx(d, "decoder"),
+            tokens=str(d / "tokens.txt"),
+            num_threads=threads or cfg["threads"],
+        )
     kwargs = dict(
         num_threads=threads or cfg["threads"],
         model_type=_model_type(d),
@@ -64,6 +92,9 @@ def offline(
     )
 
 
+_DEFAULT_OFFLINE_FN = offline
+
+
 def get_offline(
     cfg: dict,
     model: str | None = None,
@@ -72,14 +103,30 @@ def get_offline(
     decoding_method: str = "greedy_search",
     max_active_paths: int = 4,
 ):
+    if offline is not _DEFAULT_OFFLINE_FN:
+        return offline(
+            cfg,
+            model=model,
+            threads=threads,
+            blank_penalty=blank_penalty,
+            decoding_method=decoding_method,
+            max_active_paths=max_active_paths,
+        )
     bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
-    key = (model or cfg.get("offline_model"), threads or cfg.get("threads", 4), bp_key, decoding_method, max_active_paths)
+    key = (
+        str(cfg.get("models_dir", "")),
+        model or cfg.get("offline_model"),
+        threads or cfg.get("threads", 4),
+        bp_key,
+        decoding_method,
+        max_active_paths,
+    )
     with _offline_cache_lock:
         if key in _offline_cache:
             val = _offline_cache.pop(key)
             _offline_cache[key] = val
             return val
-        if len(_offline_cache) >= 3:
+        while len(_offline_cache) >= _MAX_OFFLINE_CACHE:
             oldest_key = next(iter(_offline_cache))
             del _offline_cache[oldest_key]
             import gc
@@ -141,107 +188,110 @@ def transcribe_batch_detailed(rec, chunks: list[np.ndarray], max_batch_size: int
                     pass
         for s in streams:
             res = s.result
+            tokens = list(res.tokens) if hasattr(res, "tokens") else []
             log_probs = list(res.ys_log_probs) if hasattr(res, "ys_log_probs") else []
-            conf = float(np.mean(np.exp(log_probs))) if len(log_probs) else 0.0
+            token_confs = [float(np.clip(np.exp(lp), 0.0, 1.0)) for lp in log_probs]
+            conf = float(np.mean(token_confs)) if token_confs else (0.75 if tokens else 0.0)
             durations = list(res.durations) if hasattr(res, "durations") else []
             zero_skips = sum(1 for d in durations if d == 0)
-            zero_skip_ratio = float(zero_skips / max(len(durations), 1))
+            zero_skip_ratio = float(zero_skips / max(len(durations), 1)) if durations else 0.0
             results.append({
                 "text": res.text.strip(),
                 "words": list(res.words) if hasattr(res, "words") and res.words else res.text.strip().split(),
-                "tokens": list(res.tokens) if hasattr(res, "tokens") else [],
+                "tokens": tokens,
                 "timestamps": list(res.timestamps) if hasattr(res, "timestamps") else [],
                 "durations": durations,
                 "log_probs": log_probs,
+                "token_confs": token_confs,
                 "confidence": conf,
                 "zero_skip_ratio": zero_skip_ratio,
             })
     return results
 
 
-# Multilingual support
-_multilingual_offline_cache: dict = {}
-_multilingual_offline_cache_lock = threading.Lock()
+# Multilingual support (delegates to unified _offline_cache to prevent duplicate 670 MB model loads)
+_multilingual_offline_cache = _offline_cache
+_multilingual_offline_cache_lock = _offline_cache_lock
 
 
-def get_multilingual_offline(cfg: dict, model: str | None = None, threads: int | None = None, blank_penalty: float | None = None):
-    """Get or create a multilingual offline recognizer.
-    
-    Multilingual models (like Parakeet TDT 1.1B or Parakeet TDT 0.6B) support multiple languages
-    and can auto-detect the spoken language.
-    """
+def get_multilingual_offline(
+    cfg: dict,
+    model: str | None = None,
+    threads: int | None = None,
+    blank_penalty: float | None = None,
+    decoding_method: str = "greedy_search",
+    max_active_paths: int = 4,
+):
+    """Get or create a multilingual offline recognizer, sharing the unified recognizer cache."""
     name = model or cfg.get("multilingual_model")
     try:
-        d = _resolve(cfg, name, "multilingual_model")
-    except (FileNotFoundError, ValueError):
+        _resolve(cfg, name, "multilingual_model")
+    except (FileNotFoundError, ValueError, KeyError):
         name = model or cfg.get("offline_model")
-        d = _resolve(cfg, name, "offline_model")
-    
-    bp_key = round(float(blank_penalty), 2) if blank_penalty is not None else None
-    key = (name, threads or cfg.get("threads", 4), bp_key)
-    
-    with _multilingual_offline_cache_lock:
-        if key in _multilingual_offline_cache:
-            val = _multilingual_offline_cache.pop(key)
-            _multilingual_offline_cache[key] = val
-            return val
-        if len(_multilingual_offline_cache) >= 3:
-            oldest_key = next(iter(_multilingual_offline_cache))
-            del _multilingual_offline_cache[oldest_key]
-            import gc
-            gc.collect()
-        kwargs = dict(num_threads=threads or cfg["threads"], model_type=_model_type(d))
-        if blank_penalty is not None:
-            kwargs["blank_penalty"] = float(blank_penalty)
-        _multilingual_offline_cache[key] = sherpa_onnx.OfflineRecognizer.from_transducer(
-            **_files(d), **kwargs
-        )
-        return _multilingual_offline_cache[key]
+        _resolve(cfg, name, "offline_model")
+    return get_offline(
+        cfg,
+        model=name,
+        threads=threads,
+        blank_penalty=blank_penalty,
+        decoding_method=decoding_method,
+        max_active_paths=max_active_paths,
+    )
 
 
-def detect_language_from_audio(rec, samples: np.ndarray, min_duration: float = 2.0) -> tuple[str, float]:
-    """Detect language from audio using the multilingual model.
-    
-    Returns (language_code, confidence)
-    
-    Note: This is a simple heuristic - runs recognition on first min_duration
-    seconds and uses text-based language detection.
-    """
-    from . import translation
+def detect_language_from_audio(rec, samples: np.ndarray, min_duration: float = 3.0) -> tuple[str, float]:
+    """Detect spoken language from the highest speech-band energy spans of an audio signal."""
+    from . import audio, translation
     
     if len(samples) == 0:
         return "en", 0.0
     
-    # Use first min_duration seconds for detection
-    detect_samples = int(min_duration * SR)
-    chunk = samples[:min(detect_samples, len(samples))]
+    win_len = max(int(max(min_duration, 2.5) * SR), SR)
+    if len(samples) <= win_len:
+        candidate_chunks = [samples]
+    else:
+        step = max(SR, win_len // 2)
+        scored = []
+        for start in range(0, len(samples) - win_len + 1, step):
+            sl = samples[start : start + win_len]
+            scored.append((audio.speech_band_energy(sl), start, sl))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = []
+        used_starts = []
+        for _, st_idx, sl in scored:
+            if all(abs(st_idx - u) >= win_len // 2 for u in used_starts):
+                chosen.append(sl)
+                used_starts.append(st_idx)
+            if len(chosen) >= 3:
+                break
+        candidate_chunks = chosen or [samples[:win_len]]
     
-    # Transcribe
-    texts = transcribe(rec, [chunk])
-    text = texts[0] if texts else ""
+    collected = []
+    for ch in candidate_chunks:
+        txts = transcribe(rec, [ch])
+        if txts and txts[0].strip():
+            collected.append(txts[0].strip())
+        if sum(len(t.split()) for t in collected) >= 6:
+            break
     
-    # Use text-based detection
-    if text:
-        return translation.detect_language_simple(text)
+    full_text = " ".join(collected).strip()
+    if full_text:
+        return translation.detect_language_simple(full_text)
     return "en", 0.0
 
 
 def transcribe_multilingual(rec, chunks: list[np.ndarray]) -> list[tuple[str, str]]:
-    """Transcribe with language detection per chunk.
-    
-    Returns list of (text, detected_language) tuples.
-    """
+    """Transcribe chunks once and detect language directly from each decoded transcript."""
+    from . import translation
+
     results = []
     for c in chunks:
         s = rec.create_stream()
         s.accept_waveform(SR, c)
         rec.decode_stream(s)
         text = s.result.text.strip()
-        
-        # Detect language from the transcribed text
-        lang, conf = detect_language_from_audio(rec, c, min_duration=0.5)
+        lang, _ = translation.detect_language_simple(text) if text else ("en", 0.0)
         results.append((text, lang))
-    
     return results
 
 
@@ -255,14 +305,18 @@ def catalog(cfg: dict) -> list[dict]:
     if not md.exists():
         return out
     for p in sorted(md.iterdir()):
-        if p.is_dir() and (p / "tokens.txt").exists():
+        if p.is_dir() and _is_supported_asr_dir(p):
             kind = "asr-streaming" if "streaming" in p.name else "asr-offline"
-            active = p.name in (cfg["streaming_model"] if kind == "asr-streaming" else cfg["offline_model"],)
+            active = p.name in (cfg.get("streaming_model") if kind == "asr-streaming" else cfg.get("offline_model"),)
+            size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        elif p.is_dir() and (p / "model.bin").exists():
+            kind = "translation"
+            active = p.name == cfg.get("translation_model")
             size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
         elif p.suffix == ".onnx" and p.name.startswith(DENOISER_PREFIXES):
-            kind, active, size = "denoiser", p.name == cfg["robust_denoiser"], p.stat().st_size
+            kind, active, size = "denoiser", p.name == cfg.get("robust_denoiser"), p.stat().st_size
         elif p.name.startswith("silero_vad"):
-            kind, active, size = "vad", p.name == cfg["vad_model"], p.stat().st_size
+            kind, active, size = "vad", p.name == cfg.get("vad_model"), p.stat().st_size
         else:
             continue
         out.append(dict(name=p.name, kind=kind, size_mb=size / 1e6, active=active))
@@ -288,7 +342,7 @@ def apply_model_args(cfg: dict, names: list[str]) -> dict:
     rows = catalog(cfg)
     for n in names:
         p = Path(n)
-        if p.is_dir() and (p / "tokens.txt").exists():  # explicit path to an ASR model directory
+        if p.is_dir() and _is_supported_asr_dir(p):  # explicit path to an ASR model directory
             kind = "asr-streaming" if "streaming" in p.name else "asr-offline"
             cfg["streaming_model" if kind == "asr-streaming" else "offline_model"] = str(p)
             continue
@@ -297,6 +351,12 @@ def apply_model_args(cfg: dict, names: list[str]) -> dict:
             avail = ", ".join(r["name"] for r in rows)
             raise SystemExit(f"--model {n}: {'no such model' if not hits else 'ambiguous'}; installed: {avail}\n(try --model list)")
         r = hits[0]
-        key = {"asr-streaming": "streaming_model", "asr-offline": "offline_model", "denoiser": "robust_denoiser", "vad": "vad_model"}[r["kind"]]
+        key = {
+            "asr-streaming": "streaming_model",
+            "asr-offline": "offline_model",
+            "denoiser": "robust_denoiser",
+            "vad": "vad_model",
+            "translation": "translation_model",
+        }[r["kind"]]
         cfg[key] = r["name"]
     return cfg

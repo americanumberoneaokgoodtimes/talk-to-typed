@@ -169,22 +169,37 @@ stt/
 
 ## 6. Subfloor Speech Recovery Mathematics
 
-### Quantile Noise Floor Tracking
-For audio signal $x[n]$, short-time RMS is evaluated across 50ms frames ($M = 800$ samples at 16 kHz):
+### Quantile Noise Floor Tracking & Sustained Peak Estimation
+For conditioned audio signal $x[n]$ (post-HPF and harmonic notch filtering), short-time RMS is evaluated across 50ms frames ($M = 800$ samples at 16 kHz):
 $$\text{RMS}_k = \sqrt{\frac{1}{M} \sum_{m=0}^{M-1} x[kM + m]^2}$$
 - **Noise Floor**: $\sigma_{\text{noise}} = \text{Percentile}(\{\text{RMS}_k\}, 15)$
-- **Peak Signal**: $\sigma_{\text{peak}} = \text{Percentile}(\{\text{RMS}_k\}, 95)$
-- **Empirical SNR**:
+- **Peak Signal**: $\sigma_{\text{peak}} = \max\left(\text{Percentile}(\{\text{RMS}_k\}, 95), \; \text{Mean}(\text{Top}_8(\{\text{RMS}_k\}))\right)$
+- **Empirical In-Band SNR**:
   $$\text{SNR}_{\text{dB}} = 20 \log_{10}\left(\frac{\max(\sigma_{\text{peak}}, 10^{-6})}{\max(\sigma_{\text{noise}}, 10^{-6})}\right)$$
 
-### Dynamic Transducer Blank Penalty
-Neural transducer joiners compute activations over the vocabulary:
-$$P(y | x) = \text{Softmax}(z_{\text{token}})$$
-Under low-SNR conditions, the model favors the blank token $\phi$. The blank penalty dynamically subtracts a bias $\beta$ from the blank logit:
-$$\beta = \text{clip}\left(0.55 + (8.0 - \text{SNR}_{\text{dB}}) \times 0.03, \; 0.30, \; 1.05\right)$$
-For silent windows returning empty transcripts despite speech-band energy, $\beta$ escalates to $\beta + 0.20$ and $\beta + 0.40$ to force token emission.
+### 4-Cue Speech Presence Probability (SPP)
+To detect talking buried near or below the broadband noise floor ($\text{SNR} \in [-8\text{ dB}, +3\text{ dB}]$), `stt` computes a 50 Hz frame-rate composite probability $\text{SPP}[m] \in [0, 1]$ combining four orthogonal acoustic cues:
+1. **Neural Denoiser Emergence ($C_{\text{den}}$)**: Local frame RMS of GTCRN/DPDFNet output normalized against the 20th-percentile rolling denoised background floor.
+2. **Syllabic Log-Envelope Modulation ($C_{\text{mod}}$)**: Bandpass-filtered energy in the $2.0 - 8.0\text{ Hz}$ syllabic modulation frequency band relative to out-of-band envelope power.
+3. **Formant Spectral Structure ($C_{\text{struct}}$)**: Inversion of geometric-to-arithmetic spectral flatness across the $300 - 3400\text{ Hz}$ vowel/consonant formant band:
+   $$\text{Flatness}[m] = \frac{\exp\left(\frac{1}{K}\sum_{k} \ln |X[m, k]|^2\right)}{\frac{1}{K}\sum_k |X[m, k]|^2}$$
+4. **Low-Band Periodicity ($C_{\text{pitch}}$)**: Symmetrically normalized Cauchy-Schwarz autocorrelation peak across pitch lags in the $80 - 900\text{ Hz}$ band.
 
-### Coherence Scoring
-To reject stochastic noise hallucinations, candidates are scored using linguistic bigram repetition and dictionary heuristics:
-$$\text{Score}(T) = \text{len}(T) \times \left(1.0 - 2.5 \times \frac{\text{duplicate bigrams}}{\text{total bigrams}}\right) \times \left(\frac{\text{valid dictionary tokens}}{\text{total tokens}}\right)$$
-Only candidate transcripts exceeding threshold $\tau = 4.0$ are accepted into the timeline.
+Composite SPP:
+$$\text{SPP}[m] = 0.42 \, C_{\text{den}}[m] + 0.24 \, C_{\text{mod}}[m] + 0.19 \, C_{\text{struct}}[m] + 0.15 \, C_{\text{pitch}}[m]$$
+
+### Ephraim-Malah Log-MMSE Spectral Gate
+For stationary noise suppression without musical-noise plosive artifacts, spectral gain is calculated via rational Padé approximation of the exponential integral $E_1(v)$:
+$$G_{\text{LogMMSE}}(\xi, \gamma) = \frac{\xi}{1 + \xi} \exp\left(\frac{1}{2} E_1\left(\frac{\xi}{1+\xi}\gamma\right)\right)$$
+where $\xi$ is the a priori SNR (decision-directed) and $\gamma$ is the a posteriori SNR.
+
+### 7-Stream Dynamic CN-ROVER Fusion
+Candidate streams (`gtcrn`, `hybrid`, `blend`, `dp4`, `formant_agc`, `spec_gate`, `hp`) are decoded in parallel via `rec.decode_streams()`. Time-synchronous Confusion Network ROVER clusters overlapping word hypotheses and computes a posterior score combining stream prior weight and per-token neural confidence:
+$$\text{Score}(w) = 0.45 \cdot \frac{\sum_{s \in \text{voters}} W_s}{\sum_s W_s} + 0.55 \cdot \frac{\sum_{s \in \text{voters}} W_s \, C_{w, s}}{\sum_{s \in \text{voters}} W_s}$$
+Single-stream specialist recoveries (such as `dp4` or `formant_agc` recovering a word submerged below GTCRN's suppression threshold) are emitted when weighted confidence $\ge 0.72$, duration $> 0$, and local $\text{SPP} \ge 0.45$.
+
+### Acoustic Burial Depth & Telemetry
+Transcribed segments evaluate active speech RMS against local quiet-frame background floor $\sigma_{\text{floor}}$ and clear foreground speech reference $\sigma_{\text{fg}}$:
+- **Burial below noise floor**: $\Delta_{\text{floor}} = -\text{SNR}_{\text{dB}} = 20 \log_{10}(\sigma_{\text{floor}} / \sigma_{\text{seg}})$
+- **Burial depth below foreground**: $\Delta_{\text{fg}} = 20 \log_{10}(\sigma_{\text{seg}} / \sigma_{\text{fg}})$
+Telemetric layer classifications (`foreground`, `background-faint`, `subnoise-buried`) are logged to `stderr`, exported in `--jsonl`, and displayed as visual badges in the Web UI.

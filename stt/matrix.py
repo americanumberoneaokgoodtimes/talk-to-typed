@@ -80,22 +80,22 @@ def get_available_combinations(cfg: dict) -> list[dict]:
                 "type": "offline",
             },
             {
+                "id": "parakeet_formant_agc_beam",
+                "name": "Parakeet-TDT | Multiband Formant AGC | Beam-16 (BP=0.55)",
+                "category": "Offline Beam Search",
+                "model": offline_model,
+                "sig": "formant_agc",
+                "bp": 0.55,
+                "beam": True,
+                "type": "offline",
+            },
+            {
                 "id": "parakeet_clean_beam",
                 "name": "Parakeet-TDT | Clean HP+Notch | Beam-16 (BP=0.40)",
                 "category": "Offline Beam Search",
                 "model": offline_model,
                 "sig": "clean_hp",
                 "bp": 0.40,
-                "beam": True,
-                "type": "offline",
-            },
-            {
-                "id": "parakeet_gtcrn_eq_beam",
-                "name": "Parakeet-TDT | GTCRN + Formant EQ | Beam-16 (BP=0.85)",
-                "category": "Offline Beam Search",
-                "model": offline_model,
-                "sig": "gtcrn_eq",
-                "bp": 0.85,
                 "beam": True,
                 "type": "offline",
             },
@@ -110,12 +110,22 @@ def get_available_combinations(cfg: dict) -> list[dict]:
                 "type": "offline",
             },
             {
-                "id": "parakeet_formant_agc_beam",
-                "name": "Parakeet-TDT | Multiband Formant AGC | Beam-16 (BP=0.55)",
+                "id": "parakeet_dp4_beam",
+                "name": "Parakeet-TDT | DPDFNet-4 | Beam-16 (BP=0.50)",
                 "category": "Offline Beam Search",
                 "model": offline_model,
-                "sig": "formant_agc",
-                "bp": 0.55,
+                "sig": "dp4",
+                "bp": 0.50,
+                "beam": True,
+                "type": "offline",
+            },
+            {
+                "id": "parakeet_dp8_beam",
+                "name": "Parakeet-TDT | DPDFNet-8 | Beam-16 (BP=0.50)",
+                "category": "Offline Beam Search",
+                "model": offline_model,
+                "sig": "dp8",
+                "bp": 0.50,
                 "beam": True,
                 "type": "offline",
             },
@@ -140,22 +150,12 @@ def get_available_combinations(cfg: dict) -> list[dict]:
                 "type": "offline",
             },
             {
-                "id": "parakeet_dp4_beam",
-                "name": "Parakeet-TDT | DPDFNet-4 | Beam-16 (BP=0.50)",
+                "id": "parakeet_gtcrn_eq_beam",
+                "name": "Parakeet-TDT | GTCRN + Formant EQ | Beam-16 (BP=0.85)",
                 "category": "Offline Beam Search",
                 "model": offline_model,
-                "sig": "dp4",
-                "bp": 0.50,
-                "beam": True,
-                "type": "offline",
-            },
-            {
-                "id": "parakeet_dp8_beam",
-                "name": "Parakeet-TDT | DPDFNet-8 | Beam-16 (BP=0.50)",
-                "category": "Offline Beam Search",
-                "model": offline_model,
-                "sig": "dp8",
-                "bp": 0.50,
+                "sig": "gtcrn_eq",
+                "bp": 0.85,
                 "beam": True,
                 "type": "offline",
             },
@@ -256,8 +256,9 @@ def run_matrix(
     use_color = _color_enabled()
 
     # 1. Physical Acoustic Profiling & DSP Pre-filters
-    prof = audio.profile_audio(samples)
-    clean_hp = audio.butterworth_highpass(samples, cutoff_hz=prof.hpf_cutoff_hz)
+    declipped, _ = audio.soft_declip(samples)
+    prof = audio.profile_audio(declipped)
+    clean_hp = audio.butterworth_highpass(declipped, cutoff_hz=prof.hpf_cutoff_hz)
     if prof.notch_freqs:
         clean_hp = audio.harmonic_notch_filter(clean_hp, freqs=prof.notch_freqs)
     clean_hp, _ = audio.suppress_impulsive_clicks(clean_hp)
@@ -274,7 +275,10 @@ def run_matrix(
 
     dp4 = None
     try:
-        dp4 = audio.denoise(clean_hp, dict(cfg, robust_denoiser="dpdfnet4.onnx"))
+        dp4 = audio.denoise(
+            clean_hp,
+            dict(cfg, robust_denoiser="dpdfnet4.onnx", dpdfnet_attenuation_limit_db=15.0),
+        )
     except Exception:
         dp4 = gtcrn
 
@@ -375,14 +379,12 @@ def run_matrix(
                     decoding_method=method,
                     max_active_paths=16,
                 )
-                for s, e, c in chunks_with_time:
-                    c_norm = audio.normalize(c)
-                    st = rec.create_stream()
-                    st.accept_waveform(sr, c_norm)
-                    rec.decode_stream(st)
-                    t = st.result.text.strip()
-                    if t:
-                        results.append({"start": s + time_offset, "end": e + time_offset, "text": t})
+                norm_chunks = [audio.normalize(c) for _, _, c in chunks_with_time]
+                texts = asr.transcribe_batch(rec, norm_chunks) if norm_chunks else []
+                for (s, e, _), t in zip(chunks_with_time, texts):
+                    t_clean = t.strip()
+                    if t_clean:
+                        results.append({"start": s + time_offset, "end": e + time_offset, "text": t_clean})
 
             elif combo["type"] == "streaming":
                 import sherpa_onnx
@@ -409,6 +411,11 @@ def run_matrix(
                         results.append({"start": s + time_offset, "end": e + time_offset, "text": t})
 
         elapsed = time.time() - t0
+        if progress_cb is not None:
+            try:
+                progress_cb(idx + 1, total_combos)
+            except TypeError:
+                progress_cb()
 
         # Print color-coded results
         if results:

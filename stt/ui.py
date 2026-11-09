@@ -837,10 +837,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   const progSpeed = document.getElementById('progSpeed');
 
   function formatSec(s) {
-    if (isNaN(s)) return "00:00";
-    const m = Math.floor(s / 60);
-    const sec = (s % 60).toFixed(1);
-    return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(4, '0')}`;
+    if (isNaN(s) || s < 0) return "00:00.000";
+    const totalMs = Math.round(s * 1000);
+    const ms = totalMs % 1000;
+    const totalSec = Math.floor(totalMs / 1000);
+    const sec = totalSec % 60;
+    const totalMin = Math.floor(totalSec / 60);
+    if (totalMin >= 60) {
+      const h = Math.floor(totalMin / 60);
+      const m = totalMin % 60;
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+    }
+    return `${totalMin.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
   }
 
   function escapeHtml(text) {
@@ -880,18 +888,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   };
 
-  // Sliders
+  // Sliders & manual override tracking (so 'auto' strategy keeps auto-tuned DSP unless user adjusts a slider)
+  const touchedControls = new Set();
   const rumbleCutoff = document.getElementById('rumbleCutoff');
   const valRumble = document.getElementById('valRumble');
-  rumbleCutoff.addEventListener('input', () => valRumble.textContent = `${rumbleCutoff.value} Hz`);
+  rumbleCutoff.addEventListener('input', () => {
+    touchedControls.add('rumble_cutoff');
+    valRumble.textContent = `${rumbleCutoff.value} Hz`;
+  });
 
   const formantBoost = document.getElementById('formantBoost');
   const valBoost = document.getElementById('valBoost');
-  formantBoost.addEventListener('input', () => valBoost.textContent = `+${parseFloat(formantBoost.value).toFixed(1)} dB`);
+  formantBoost.addEventListener('input', () => {
+    touchedControls.add('formant_boost');
+    valBoost.textContent = `+${parseFloat(formantBoost.value).toFixed(1)} dB`;
+  });
 
   const blankPenalty = document.getElementById('blankPenalty');
   const valBlank = document.getElementById('valBlank');
-  blankPenalty.addEventListener('input', () => valBlank.textContent = parseFloat(blankPenalty.value).toFixed(1));
+  blankPenalty.addEventListener('input', () => {
+    touchedControls.add('blank_penalty');
+    valBlank.textContent = parseFloat(blankPenalty.value).toFixed(1);
+  });
 
   // ── Window Overlap Visualization ──────────────────────────────────────────
   function drawWindowViz() {
@@ -995,8 +1013,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       `window ${winSec.toFixed(1)}s  |  step ${stepSec.toFixed(1)}s  |  overlap ${overlapPct}%`;
   }
 
-  document.getElementById('windowSize').addEventListener('input', drawWindowViz);
-  document.getElementById('stepSize').addEventListener('input', drawWindowViz);
+  document.getElementById('windowSize').addEventListener('input', () => {
+    touchedControls.add('window_size');
+    drawWindowViz();
+  });
+  document.getElementById('stepSize').addEventListener('input', () => {
+    touchedControls.add('step_size');
+    drawWindowViz();
+  });
   drawWindowViz();  // initial draw
 
   // File pickers
@@ -1047,13 +1071,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       audioWrap.style.display = 'flex';
     }
 
+    const strategyVal = document.getElementById('strategy').value;
+    const useManual = (k) => strategyVal !== 'auto' || touchedControls.has(k);
+
     const payload = {
-      strategy: document.getElementById('strategy').value,
-      rumble_cutoff: parseFloat(rumbleCutoff.value),
-      formant_boost: parseFloat(formantBoost.value),
-      blank_penalty: parseFloat(blankPenalty.value),
-      window_size: parseFloat(document.getElementById('windowSize').value),
-      step_size: parseFloat(document.getElementById('stepSize').value),
+      strategy: strategyVal,
+      rumble_cutoff: useManual('rumble_cutoff') ? parseFloat(rumbleCutoff.value) : null,
+      formant_boost: useManual('formant_boost') ? parseFloat(formantBoost.value) : null,
+      blank_penalty: useManual('blank_penalty') ? parseFloat(blankPenalty.value) : null,
+      window_size: useManual('window_size') ? parseFloat(document.getElementById('windowSize').value) : null,
+      step_size: useManual('step_size') ? parseFloat(document.getElementById('stepSize').value) : null,
       threads: parseInt(document.getElementById('threads').value),
       recursive: document.getElementById('recursive').checked,
       server_path: pathVal || null,
@@ -1191,15 +1218,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
             } else if (eventType === "segment") {
               segmentsHistory.push(data);
               const isBilingual = data.translated !== undefined && data.translated !== null;
+              const tsInterval = `[${formatSec(data.start)} -> ${formatSec(data.end)}]`;
               
-              // Build display text
-              let displayText = data.text;
+              // Build display text with preserved timeline interval (Rule 4)
+              let displayText = `${tsInterval} ${data.text}`;
               if (isBilingual && data.translated) {
-                displayText = `${data.text} / ${data.translated}`;
+                displayText = `${tsInterval} ${data.text} / ${data.translated}`;
+              }
+              if (data.layer === "subnoise-buried" && typeof data.snr_db === "number") {
+                const fgNote = typeof data.depth_vs_foreground_db === "number" ? `, ${data.depth_vs_foreground_db.toFixed(1)}dB vs fg` : "";
+                displayText += `  [buried: ${data.snr_db.toFixed(1)}dB vs floor${fgNote}]`;
               }
               
-              if (output.value && !output.value.endsWith("\n") && !output.value.endsWith(" ")) {
-                output.value += " ";
+              if (output.value && !output.value.endsWith("\n")) {
+                output.value += "\n";
               }
               output.value += displayText;
               output.scrollTop = output.scrollHeight;
@@ -1215,6 +1247,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 segHtml += `<span class="seg-text">${escapeHtml(data.text)}</span><span class="seg-text" style="color: var(--text-muted); font-size: 0.85rem;"> → ${escapeHtml(data.translated)}</span>`;
               } else {
                 segHtml += `<span class="seg-text">${escapeHtml(data.text)}</span>`;
+              }
+              if (data.layer === "subnoise-buried" && typeof data.snr_db === "number") {
+                const fgDelta = typeof data.depth_vs_foreground_db === "number" ? ` · ${data.depth_vs_foreground_db.toFixed(1)}dB fg` : "";
+                segHtml += `<span class="seg-time" style="color: var(--warning); font-size: 0.72rem; margin-left: 6px;">[BURIED ${data.snr_db >= 0 ? '+' : ''}${data.snr_db.toFixed(1)}dB floor${fgDelta}]</span>`;
+              } else if (data.layer === "background-faint" && typeof data.snr_db === "number") {
+                const fgDelta = typeof data.depth_vs_foreground_db === "number" ? ` · ${data.depth_vs_foreground_db.toFixed(1)}dB fg` : "";
+                segHtml += `<span class="seg-time" style="color: var(--accent); font-size: 0.72rem; margin-left: 6px;">[FAINT ${data.snr_db >= 0 ? '+' : ''}${data.snr_db.toFixed(1)}dB floor${fgDelta}]</span>`;
               }
               if (data.lang) {
                 segHtml += `<span class="seg-time" style="color: var(--accent); font-size: 0.7rem;">[${data.lang.toUpperCase()}]</span>`;
@@ -1298,15 +1337,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     downloadFile("transcript.jsonl", lines, "application/json");
   };
 
+  function formatSubtitleClock(sec, sep) {
+    const totalMs = Math.max(0, Math.round((sec || 0) * 1000));
+    const ms = totalMs % 1000;
+    const totalSec = Math.floor(totalMs / 1000);
+    const s = totalSec % 60;
+    const totalMin = Math.floor(totalSec / 60);
+    const m = totalMin % 60;
+    const h = Math.floor(totalMin / 60);
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}${sep}${ms.toString().padStart(3, '0')}`;
+  }
+
   // Export SRT
   document.getElementById('btnExportSrt').onclick = () => {
     let srt = "";
     segmentsHistory.forEach((seg, idx) => {
-      const formatTime = (sec) => {
-        const d = new Date(sec * 1000);
-        return d.toISOString().substr(11, 8) + "," + ("00" + d.getMilliseconds()).slice(-3);
-      };
-      srt += `${idx + 1}\n${formatTime(seg.start)} --> ${formatTime(seg.end)}\n${seg.text}\n\n`;
+      const body = (seg.translated !== undefined && seg.translated !== null && seg.translated !== "")
+        ? `${seg.text}\n${seg.translated}`
+        : seg.text;
+      srt += `${idx + 1}\n${formatSubtitleClock(seg.start, ',') } --> ${formatSubtitleClock(seg.end, ',')}\n${body}\n\n`;
     });
     downloadFile("transcript.srt", srt, "text/plain");
   };
@@ -1315,11 +1364,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   document.getElementById('btnExportVtt').onclick = () => {
     let vtt = "WEBVTT\n\n";
     segmentsHistory.forEach((seg, idx) => {
-      const formatTime = (sec) => {
-        const d = new Date(sec * 1000);
-        return d.toISOString().substr(11, 8) + "." + ("00" + d.getMilliseconds()).slice(-3);
-      };
-      vtt += `${idx + 1}\n${formatTime(seg.start)} --> ${formatTime(seg.end)}\n${seg.text}\n\n`;
+      const body = (seg.translated !== undefined && seg.translated !== null && seg.translated !== "")
+        ? `${seg.text}\n${seg.translated}`
+        : seg.text;
+      vtt += `${idx + 1}\n${formatSubtitleClock(seg.start, '.')} --> ${formatSubtitleClock(seg.end, '.')}\n${body}\n\n`;
     });
     downloadFile("transcript.vtt", vtt, "text/vtt");
   };
@@ -1402,6 +1450,67 @@ HTML_PAGE = r"""<!DOCTYPE html>
 """
 
 
+class _TranscriptionAborted(Exception):
+    """Raised internally to unwind mid-file transcription promptly when the user clicks Cancel."""
+
+
+_SENSITIVE_PATH_PARTS = {
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git", ".hg", ".svn",
+    ".env", ".netrc", ".npmrc", ".pypirc", ".azure", ".gcloud", ".pki",
+}
+
+
+def _is_same_origin_or_local(headers) -> bool:
+    """Reject cross-origin browser requests (DNS-rebinding / CSRF defense) while allowing local requests."""
+    origin = (headers.get("Origin") or "").strip()
+    if not origin:
+        return True
+    try:
+        parsed_origin = urllib.parse.urlparse(origin)
+        host = (parsed_origin.hostname or "").lower()
+    except Exception:
+        return False
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    req_host = (headers.get("Host") or "").split(":")[0].strip("[]").lower()
+    return bool(req_host and host == req_host)
+
+
+def _validate_local_media_path(raw_path: str, allow_directory: bool = False) -> tuple[Path | None, int, str]:
+    """Validate local path for versatile multi-drive media access while blocking non-media & credential paths."""
+    from .cli import MEDIA_EXTENSIONS
+
+    if not raw_path or not isinstance(raw_path, str):
+        return None, 400 if allow_directory else 404, "Path not provided"
+
+    p_raw = Path(raw_path)
+    if not p_raw.exists():
+        return None, 400 if allow_directory else 404, "Path not found"
+
+    try:
+        p = p_raw.resolve()
+    except OSError:
+        return None, 400, "Invalid path"
+
+    # Block credential / secret dot-directories regardless of drive or extension
+    lowered_parts = {part.lower() for part in p.parts}
+    if lowered_parts & _SENSITIVE_PATH_PARTS:
+        return None, 403, "Access to hidden or credential directory denied"
+
+    if p.is_dir():
+        if not allow_directory:
+            return None, 404, "Audio file not found"
+        return p, 200, "OK"
+
+    if not p.is_file():
+        return None, 404, "Audio file not found"
+
+    if p.suffix.lower() not in MEDIA_EXTENSIONS:
+        return None, 403, f"Unsupported media file extension: {p.suffix or '(none)'}"
+
+    return p, 200, "OK"
+
+
 class STTRequestHandler(http.server.BaseHTTPRequestHandler):
     """Zero-dependency HTTP server delivering the talk-to-typed frontend and streaming API."""
 
@@ -1433,39 +1542,15 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif parsed.path == "/api/audio":
+            if not _is_same_origin_or_local(self.headers):
+                self.send_error(403, "Cross-origin request denied")
+                return
+
             query = urllib.parse.parse_qs(parsed.query)
             target_path = query.get("path", [None])[0]
-            if not target_path or not Path(target_path).is_file():
-                self.send_error(404, "Audio file not found")
-                return
-            p = Path(target_path).resolve()
-            
-            # Security: restrict to allowed directories
-            allowed_roots = [
-                Path.home().resolve(),
-                Path.cwd().resolve(),
-                Path(tempfile.gettempdir()).resolve(),
-            ]
-            # Add configured models/data directories if they exist
-            try:
-                from . import config as stt_config
-                allowed_roots.append(Path(stt_config.DATA_DIR).resolve())
-                allowed_roots.append(Path(stt_config.CONFIG_PATH).parent.resolve())
-            except Exception:
-                pass
-            
-            # Check if path is under any allowed root
-            allowed = False
-            for root in allowed_roots:
-                try:
-                    p.relative_to(root)
-                    allowed = True
-                    break
-                except ValueError:
-                    continue
-            
-            if not allowed:
-                self.send_error(403, "Path not in allowed directories")
+            p, status_code, err_msg = _validate_local_media_path(target_path, allow_directory=False)
+            if p is None:
+                self.send_error(status_code, err_msg)
                 return
 
             content_type = "audio/wav"
@@ -1478,15 +1563,14 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                 content_type = "audio/ogg"
             elif suf in (".flac",):
                 content_type = "audio/flac"
-            elif suf in (".mp4", ".mkv", ".webm"):
+            elif suf in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
                 content_type = "video/mp4"
 
             try:
                 size = p.stat().st_size
                 range_header = self.headers.get("Range")
-                
+
                 if range_header:
-                    # Parse Range header: "bytes=start-end"
                     range_match = range_header.strip().lower()
                     if not range_match.startswith("bytes="):
                         self.send_error(416, "Invalid Range header")
@@ -1495,13 +1579,13 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     parts = range_spec.split("-")
                     start = int(parts[0]) if parts[0] else 0
                     end = int(parts[1]) if len(parts) > 1 and parts[1] else size - 1
-                    
+
                     if start >= size or end >= size or start > end:
-                        self.send_error(416, "Range Not Satisfiable")
+                        self.send_response(416, "Range Not Satisfiable")
                         self.send_header("Content-Range", f"bytes */{size}")
                         self.end_headers()
                         return
-                    
+
                     content_length = end - start + 1
                     self.send_response(206)
                     self.send_header("Content-Type", content_type)
@@ -1509,7 +1593,7 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                     self.send_header("Accept-Ranges", "bytes")
                     self.end_headers()
-                    
+
                     with open(p, "rb") as f:
                         f.seek(start)
                         remaining = content_length
@@ -1529,12 +1613,17 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     with open(p, "rb") as f:
                         shutil.copyfileobj(f, self.wfile)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             except Exception as e:
                 self.send_error(500, f"Internal server error: {e}")
         else:
             self.send_error(404, "Not Found")
 
     def do_POST(self):
+        if not _is_same_origin_or_local(self.headers):
+            self.send_error(403, "Cross-origin request denied")
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/transcribe_path":
             self.handle_transcribe_path()
@@ -1555,39 +1644,24 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
     def handle_transcribe_path(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
-        req = json.loads(body)
+        try:
+            req = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON request body")
+            return
         server_path = req.get("server_path")
 
-        if not server_path or not os.path.exists(server_path):
-            self.send_error(400, "Path not found")
-            return
-
-        # Security: restrict to the same allowed roots as /api/audio
-        p = Path(server_path).resolve()
-        allowed_roots = [
-            Path.home().resolve(),
-            Path.cwd().resolve(),
-            Path(tempfile.gettempdir()).resolve(),
-        ]
-        try:
-            allowed_roots.append(Path(config.DATA_DIR).resolve())
-            allowed_roots.append(Path(config.CONFIG_PATH).parent.resolve())
-        except Exception:
-            pass
-        allowed = False
-        for root in allowed_roots:
-            try:
-                p.relative_to(root)
-                allowed = True
-                break
-            except ValueError:
-                continue
-        if not allowed:
-            self.send_error(403, "Path not in allowed directories")
+        p, status_code, err_msg = _validate_local_media_path(server_path, allow_directory=True)
+        if p is None:
+            self.send_error(status_code, err_msg)
             return
 
         from .cli import collect_media_paths
-        paths = collect_media_paths([server_path], recursive=req.get("recursive", True))
+        raw_paths = collect_media_paths([str(p)], recursive=req.get("recursive", True))
+        paths = [
+            mp for mp in raw_paths
+            if not ({part.lower() for part in Path(mp).parts} & _SENSITIVE_PATH_PARTS)
+        ]
         if not paths:
             self.send_error(400, "No supported audio/video files found in given path.")
             return
@@ -1635,13 +1709,16 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     pass
 
     def stream_transcription_sse(self, paths, req, display_names=None):
+        from . import translation
+
         _transcription_abort.clear()
-        
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
 
         def send_sse(event_type, payload):
             msg = f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
@@ -1654,14 +1731,13 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             cfg = self.server.cfg
             threads = req.get("threads") or cfg.get("threads", 4)
-            blank_penalty = req.get("blank_penalty") or cfg.get("blank_penalty")
-            
-            # Check if multilingual/translation is requested
+            blank_penalty = req.get("blank_penalty") if req.get("blank_penalty") is not None else cfg.get("blank_penalty")
+
             source_lang = req.get("source_lang", "auto")
             target_lang = req.get("target_lang", "en")
-            do_translate = req.get("translate", False)
+            do_translate = bool(req.get("translate", False))
             use_multilingual = do_translate or (source_lang not in ("auto", "en"))
-            
+
             if use_multilingual:
                 rec = asr.get_multilingual_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
             else:
@@ -1671,31 +1747,58 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         strategy = req.get("strategy", "auto")
-        is_auto = strategy == "auto"
         is_subnoise = strategy in ("auto", "subnoise")
 
         t0_total = time.time()
         total_audio_sec = 0.0
 
         for path in paths:
-            # Check for abort
             if _transcription_abort.is_set():
                 send_sse("aborted", {"message": "Transcription cancelled by user"})
                 return
-            
+
             disp_name = display_names.get(path, Path(path).name) if display_names else Path(path).name
             try:
                 samples = audio.decode(path)
             except Exception as e:
                 send_sse("segment", {"file": disp_name, "start": 0, "end": 0, "text": f"[Error decoding {disp_name}: {e}]"})
                 continue
+            if samples is None:
+                send_sse("segment", {"file": disp_name, "start": 0, "end": 0, "text": f"[Error decoding {disp_name}: unreadable media file]"})
+                continue
 
             dur = len(samples) / audio.SR
             total_audio_sec += dur
 
+            t_start_file = time.time()
+
+            def progress_cb(current_step=1, total_steps=1, current_sec=None, total_sec=None,
+                            _t=t_start_file, _disp=disp_name, _dur=dur):
+                if _transcription_abort.is_set():
+                    raise _TranscriptionAborted()
+                tot_s_val = float(total_sec if total_sec is not None else _dur)
+                pct = int((current_step / max(total_steps, 1)) * 100)
+                cur_s_val = float(current_sec if current_sec is not None else (tot_s_val * pct / 100.0))
+                elapsed = time.time() - _t
+                rtf = elapsed / max(cur_s_val, 0.001)
+                eta_sec = max(0.0, tot_s_val - cur_s_val) * rtf
+                cur_m, cur_s = divmod(int(cur_s_val), 60)
+                tot_m, tot_s = divmod(int(tot_s_val), 60)
+                eta_m, eta_s = divmod(int(eta_sec), 60)
+                send_sse("progress", {
+                    "file": _disp,
+                    "pct": min(100, pct),
+                    "cur_time": f"{cur_m:02d}:{cur_s:02d}",
+                    "tot_time": f"{tot_m:02d}:{tot_s:02d}",
+                    "rtf": round(rtf, 2),
+                    "eta": f"{eta_m:02d}:{eta_s:02d}",
+                })
+
             try:
+                params = None
                 if is_subnoise:
-                    params = robust.auto_tune_settings(dur)
+                    # Pass actual waveform samples so physical SNR, hum, and rumble drive auto-tuning!
+                    params = robust.auto_tune_settings(dur, samples=samples)
                     if req.get("rumble_cutoff") is not None:
                         params["low_hz"] = float(req["rumble_cutoff"])
                     if req.get("formant_boost") is not None:
@@ -1709,74 +1812,78 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
 
                     send_sse("reasoning", {"file": disp_name, "duration": dur, "reasons": params["reasoning"]})
 
-                    t_start_file = time.time()
-                    def progress_cb(current_step, total_steps, current_sec, total_sec,
-                                    _t=t_start_file, _disp=disp_name):
-                        elapsed = time.time() - _t
-                        pct = int((current_step / total_steps) * 100) if total_steps > 0 else 0
-                        rtf = elapsed / max(current_sec, 0.001)
-                        eta_sec = max(0.0, total_sec - current_sec) * rtf
-                        cur_m, cur_s = divmod(int(current_sec), 60)
-                        tot_m, tot_s = divmod(int(total_sec), 60)
-                        eta_m, eta_s = divmod(int(eta_sec), 60)
-                        send_sse("progress", {
-                            "file": _disp,
-                            "pct": pct,
-                            "cur_time": f"{cur_m:02d}:{cur_s:02d}",
-                            "tot_time": f"{tot_m:02d}:{tot_s:02d}",
-                            "rtf": round(rtf, 2),
-                            "eta": f"{eta_m:02d}:{eta_s:02d}",
-                        })
+                level = 0 if is_subnoise else (3 if strategy == "robust" else (5 if strategy == "distant" else 0))
 
-                    triples = robust.transcribe(
-                        rec, samples, cfg, level=0, subnoise=True,
-                        params=params, progress_cb=progress_cb,
-                        model=None, threads=threads,
+                if use_multilingual:
+                    triples = robust.transcribe_multilingual(
+                        rec, samples, cfg,
+                        source_lang=source_lang,
+                        target_lang=target_lang if do_translate else None,
+                        translate=do_translate,
+                        level=level,
+                        progress_cb=progress_cb,
+                        subnoise=is_subnoise,
+                        params=params,
                     )
                 else:
-                    level = 3 if strategy == "robust" else (5 if strategy == "distant" else 0)
-                    
-                    if use_multilingual:
-                        # Multilingual transcription with optional translation
-                        triples = robust.transcribe_multilingual(
-                            rec, samples, cfg,
-                            source_lang=source_lang,
-                            target_lang=target_lang if do_translate else None,
-                            translate=do_translate,
-                            level=level,
-                            progress_cb=None,  # Could add progress callback here
-                        )
-                        
-                        # Send language detected event if auto-detect was used
-                        if source_lang == "auto" and triples:
-                            # Get detected language from first segment
-                            detected = triples[0][3] if len(triples[0]) == 4 and triples[0][3] else None
-                            if not detected and triples:
-                                # Try to detect from first segment text
-                                from . import asr
-                                detected, conf = asr.detect_language_from_audio(rec, samples[:min(int(cfg.get("lang_detect_min_duration", 2.0)) * audio.SR, len(samples))])
-                                send_sse("language_detected", {"lang": detected, "confidence": conf})
-                    else:
-                        triples = robust.transcribe(rec, samples, cfg, level=level, subnoise=False)
+                    triples = robust.transcribe(
+                        rec, samples, cfg, level=level, subnoise=is_subnoise,
+                        params=params, progress_cb=progress_cb if is_subnoise else None,
+                        model=None, threads=threads,
+                    )
+
+                detected_lang = source_lang if source_lang != "auto" else None
+                if source_lang == "auto" and triples:
+                    joined_src = " ".join(item[2] for item in triples).strip()
+                    detected_lang, conf = translation.detect_language_simple(joined_src)
+                    send_sse("language_detected", {"lang": detected_lang, "confidence": conf})
+
+            except _TranscriptionAborted:
+                send_sse("aborted", {"message": "Transcription cancelled by user"})
+                return
             except Exception as e:
                 send_sse("segment", {"file": disp_name, "start": 0, "end": 0,
                                      "text": f"[Error transcribing {disp_name}: {e}]"})
                 continue
 
-            # Send segments - handle both regular (3-tuple) and bilingual (4-tuple)
-            for item in triples:
+            seg_diags = robust.get_last_segment_diagnostics()
+            diag_by_idx = seg_diags if len(seg_diags) == len(triples) else None
+            diag_by_span = {(round(d["start"], 2), round(d["end"], 2)): d for d in seg_diags}
+
+            for idx, item in enumerate(triples):
+                if _transcription_abort.is_set():
+                    send_sse("aborted", {"message": "Transcription cancelled by user"})
+                    return
                 if len(item) == 4:
-                    s, e, src, tgt = item
-                    send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": src, "translated": tgt, "lang": source_lang if source_lang != "auto" else "auto"})
+                    s, e, src_txt, tgt_txt = item
+                    payload = {
+                        "file": disp_name,
+                        "start": round(s, 2),
+                        "end": round(e, 2),
+                        "text": src_txt,
+                        "translated": tgt_txt,
+                        "lang": detected_lang or source_lang,
+                    }
                 else:
                     s, e, text = item
-                    send_sse("segment", {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": text})
+                    payload = {"file": disp_name, "start": round(s, 2), "end": round(e, 2), "text": text}
+                    if detected_lang:
+                        payload["lang"] = detected_lang
+
+                d = diag_by_idx[idx] if diag_by_idx is not None else diag_by_span.get((round(s, 2), round(e, 2)))
+                if d:
+                    payload["layer"] = d.get("layer")
+                    payload["snr_db"] = d.get("snr_db")
+                    payload["burial_below_floor_db"] = d.get("burial_below_floor_db")
+                    if d.get("depth_vs_foreground_db") is not None:
+                        payload["depth_vs_foreground_db"] = d.get("depth_vs_foreground_db")
+                send_sse("segment", payload)
 
         dt = time.time() - t0_total
         send_sse("done", {
             "elapsed": dt,
             "total_audio": total_audio_sec,
-            "rtf": dt / max(total_audio_sec, 1e-6)
+            "rtf": dt / max(total_audio_sec, 1e-6),
         })
 
 

@@ -49,11 +49,16 @@ dependencies = [
 windows = [
     "sounddevice>=0.4.6",
 ]
+translation = [
+    "ctranslate2>=4.0.0",
+    "sentencepiece>=0.1.99",
+]
 dev = [
     "build",
     "wheel",
     "twine",
     "pytest",
+    "pytest-timeout",
 ]
 
 [project.urls]

@@ -13,7 +13,7 @@ When audio has heavy background noise, HVAC rumble, electrical hum, or when a sp
 
 `talk-to-typed` is engineered from the ground up to solve this:
 
-1. 🎙️ **Sub-Noise-Floor Speech Recovery**: When standard VAD fails, `stt` automatically falls back to an **overlapping sliding-window formant scanner**. It bypasses silence gates, strips rumble, and extracts intelligible words from audio submerged beneath the noise floor.
+1. 🎙️ **Sub-Noise-Floor & Dual-Layer Speech Recovery**: When standard VAD fails—or when faint background talking occurs between loud foreground utterances—`stt` automatically scans untranscribed gaps with a **4-cue Speech Presence Probability (SPP) detector + multi-stream formant ensemble**, extracting words submerged beneath the noise floor and logging exact burial-depth telemetry (dB vs. noise floor and dB below foreground speech).
 2. 🎛️ **Built-In Zero-Phase Acoustic Profiling**: No need for external audio editors or DSP plugins. `stt` automatically profiles your audio:
    - Detects 50 Hz vs. 60 Hz electrical grid hum and injects zero-phase harmonic notch filters.
    - Measures low-frequency rumble fraction and applies an adaptive zero-phase Butterworth filter (80–130 Hz).
@@ -73,7 +73,7 @@ stt file <audio/video> [options]    # Transcribe media files or directories
 stt mic [options]                   # Live microphone transcription
 stt ui [--host HOST] [--port PORT]  # Launch browser-based graphical workspace
 stt doctor                          # Diagnostic check of models, runtime & hardware
-stt config [get|set|show|reset]     # Manage configuration keys
+stt config [show|set|reset]         # Manage configuration keys
 ```
 
 ---
@@ -217,7 +217,7 @@ Run `stt doctor` to inspect the local installation, models, and audio hardware:
 stt doctor
 ```
 
-Run the automated test suite (51 tests covering DSP, CLI, config, pipelines, and UI):
+Run the automated test suite (115 tests covering DSP, CLI, config, pipelines, mic lifecycle, audio fixtures, and UI):
 
 ```sh
 pytest -v tests/

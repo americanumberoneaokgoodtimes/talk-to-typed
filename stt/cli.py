@@ -304,17 +304,28 @@ def format_vtt(triples: list[tuple]) -> str:
     return "\n".join(blocks)
 
 
-def format_jsonl(triples: list[tuple], file: str = "") -> str:
-    """Format as JSONL. Supports both 3-tuple and 4-tuple."""
+def format_jsonl(triples: list[tuple], file: str = "", diagnostics: list[dict] | None = None) -> str:
+    """Format as JSONL. Supports both 3-tuple and 4-tuple plus optional acoustic burial diagnostics."""
     lines = []
     bilingual = _is_bilingual(triples)
-    for item in triples:
+    diag_by_idx = diagnostics if (diagnostics and len(diagnostics) == len(triples)) else None
+    diag_by_span = {
+        (round(d["start"], 2), round(d["end"], 2)): d for d in (diagnostics or [])
+    }
+    for idx, item in enumerate(triples):
         if bilingual:
             s, e, src, tgt = item
             obj = {"file": file, "start": round(s, 2), "end": round(e, 2), "text": src, "translated": tgt}
         else:
             s, e, text = item
             obj = {"file": file, "start": round(s, 2), "end": round(e, 2), "text": text}
+        d = diag_by_idx[idx] if diag_by_idx is not None else diag_by_span.get((round(s, 2), round(e, 2)))
+        if d:
+            obj["layer"] = d.get("layer")
+            obj["snr_db"] = d.get("snr_db")
+            obj["burial_below_floor_db"] = d.get("burial_below_floor_db")
+            if d.get("depth_vs_foreground_db") is not None:
+                obj["depth_vs_foreground_db"] = d.get("depth_vs_foreground_db")
         lines.append(json.dumps(obj, ensure_ascii=False))
     return "\n".join(lines) + ("\n" if lines else "")
 
@@ -493,13 +504,13 @@ def cmd_file(args, cfg):
             # Load multilingual model for translation or non-English source
             rec = asr.get_multilingual_offline(cfg, args.model, args.threads, blank_penalty=bp)
         else:
-            rec = asr.offline(cfg, args.model, args.threads, blank_penalty=bp)
+            rec = asr.get_offline(cfg, args.model, args.threads, blank_penalty=bp)
         
         if not args.jsonl:
             print("\r\033[K[stt] Model loaded", file=sys.stderr, flush=True)
     else:
         rec = None
-    out = open(args.out, "w") if args.out else sys.stdout
+    out = open(args.out, "w", encoding="utf-8") if args.out else sys.stdout
     total_audio = total_proc = 0.0
     total_files = len(resolved_paths)
 
@@ -566,11 +577,25 @@ def cmd_file(args, cfg):
                         print(f"  • {reason}", file=sys.stderr)
 
                 progress_cb = make_progress_bar()
-                triples = robust.transcribe(
-                    rec, samples, cfg, level=0, subnoise=True,
-                    params=auto_params, progress_cb=progress_cb,
-                    model=args.model, threads=args.threads
-                )
+                if use_multilingual and (do_translate or lang_source != "en"):
+                    triples = robust.transcribe_multilingual(
+                        rec,
+                        samples,
+                        cfg,
+                        source_lang=lang_source,
+                        target_lang=lang_target if do_translate else None,
+                        translate=do_translate,
+                        level=0,
+                        progress_cb=progress_cb,
+                        subnoise=True,
+                        params=auto_params,
+                    )
+                else:
+                    triples = robust.transcribe(
+                        rec, samples, cfg, level=0, subnoise=True,
+                        params=auto_params, progress_cb=progress_cb,
+                        model=args.model, threads=args.threads,
+                    )
                 sys.stderr.write("\r\033[K")
                 sys.stderr.flush()
             else:
@@ -605,13 +630,19 @@ def cmd_file(args, cfg):
                     )
                 else:
                     # Standard English-only transcription
-                    triples = robust.transcribe(rec, samples, cfg_file, level, subnoise=False, no_fallback=no_fallback)
+                    triples = robust.transcribe(
+                        rec, samples, cfg_file, level, subnoise=False,
+                        no_fallback=no_fallback,
+                        progress_cb=progress_report if not no_fallback else None,
+                    )
 
             if time_offset > 0 and triples:
                 if len(triples[0]) == 4:
                     triples = [(s + time_offset, e + time_offset, src, tgt) for s, e, src, tgt in triples]
                 else:
                     triples = [(s + time_offset, e + time_offset, text) for s, e, text in triples]
+
+            seg_diagnostics = robust.get_last_segment_diagnostics(time_offset=time_offset)
 
             dt = time.time() - t
             total_audio += dur
@@ -630,7 +661,7 @@ def cmd_file(args, cfg):
                     sidecar_path.write_text(format_vtt(triples), encoding="utf-8")
                 elif getattr(args, "jsonl", False):
                     sidecar_path = p_obj.with_suffix(".jsonl")
-                    sidecar_path.write_text(format_jsonl(triples, path), encoding="utf-8")
+                    sidecar_path.write_text(format_jsonl(triples, path, diagnostics=seg_diagnostics), encoding="utf-8")
                 else:
                     sidecar_path = p_obj.with_suffix(".txt")
                     show_ts = getattr(args, "timestamps", True)
@@ -659,7 +690,7 @@ def cmd_file(args, cfg):
                     out.write(f"== {path}\n")
                 out.write(format_vtt(triples))
             elif getattr(args, "jsonl", False):
-                out.write(format_jsonl(triples, path))
+                out.write(format_jsonl(triples, path, diagnostics=seg_diagnostics))
             else:
                 if total_files > 1:
                     out.write(f"== {path}\n")
@@ -711,7 +742,7 @@ def cmd_mic(args, cfg):
             print()
         
         # Windows
-        if sys.platform == "win32" or True:  # Also show on other platforms for cross-compile
+        if sys.platform == "win32":
             print("Windows:")
             # DirectShow
             dshow_devs = mic.list_dshow_audio_devices()
@@ -741,7 +772,12 @@ def cmd_mic(args, cfg):
     
     if getattr(args, "interactive", False):
         interactive_wizard(args, cfg, is_file=False)
-    if _level(args, cfg) and not args.whisper and not args.distant and not getattr(args, "subnoise", False):
+    is_subnoise_mic = bool(
+        getattr(args, "subnoise", False)
+        or getattr(args, "dynamic", False)
+        or getattr(args, "auto", False)
+    )
+    if _level(args, cfg) and not args.whisper and not args.distant and not is_subnoise_mic:
         print("[stt] note: -a/--aggressiveness applies to the termux backend and --whisper/--distant; the streaming pulse backend ignores it", file=sys.stderr)
     backend = args.backend or cfg["mic_backend"]
     avail = mic.detect(cfg)
@@ -752,20 +788,40 @@ def cmd_mic(args, cfg):
     else:
         order = [backend]
     t0 = time.time()
+    do_translate = getattr(args, "translate", False) or cfg.get("translation_enabled", False)
+    target_lang = getattr(args, "lang_target", None) or cfg.get("target_language", "en")
+    source_lang = getattr(args, "lang_source", None) or cfg.get("source_language", "auto")
 
     def emit(text, start, end):
+        trans_text = None
+        if do_translate and text and text.strip():
+            try:
+                from . import translation
+                trans_model_dir = Path(cfg["models_dir"]) / cfg.get("translation_model", "nllb-200-distilled-600M")
+                if translation.is_translation_available(str(trans_model_dir)):
+                    src = source_lang
+                    if src == "auto":
+                        src, _ = translation.detect_language_simple(text)
+                    trans_text = translation.translate_text(text, src, target_lang, str(trans_model_dir))
+            except Exception:
+                pass
+
+        disp_text = f"{text} / {trans_text}" if trans_text else text
         if args.jsonl:
-            print(json.dumps({"start": round(start - t0, 2), "end": round(end - t0, 2), "text": text}, ensure_ascii=False), flush=True)
+            payload = {"start": round(start - t0, 2), "end": round(end - t0, 2), "text": text}
+            if trans_text:
+                payload["translated"] = trans_text
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
         elif getattr(args, "timestamps", True):
             s_rel = max(0.0, start - t0)
             e_rel = max(0.0, end - t0)
-            print(f"[{format_timestamp(s_rel)} -> {format_timestamp(e_rel)}] {text}", flush=True)
+            print(f"[{format_timestamp(s_rel)} -> {format_timestamp(e_rel)}] {disp_text}", flush=True)
         else:
-            print(text, flush=True)
+            print(disp_text, flush=True)
 
     # Ctrl+C / SIGTERM -> KeyboardInterrupt so `finally` blocks reap child processes.
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    if getattr(args, "subnoise", False):
+    if is_subnoise_mic:
         pulse_runner = mic.run_pulse_subnoise
     elif args.whisper or args.distant:
         pulse_runner = mic.run_pulse_utterance
@@ -862,10 +918,19 @@ def cmd_doctor(args, cfg):
     md = Path(cfg["models_dir"])
     for key in ("offline_model", "streaming_model"):
         d = md / cfg[key]
-        have = all(any((d / f"{s}{x}").exists() for x in (".int8.onnx", ".onnx")) for s in ("encoder", "decoder", "joiner")) and (d / "tokens.txt").exists()
+        if "cohere" in d.name.lower():
+            have = (d / "tokens.txt").exists() and any((d / f"encoder{x}").exists() for x in (".int8.onnx", ".onnx"))
+        else:
+            have = all(any((d / f"{s}{x}").exists() for x in (".int8.onnx", ".onnx")) for s in ("encoder", "decoder", "joiner")) and (d / "tokens.txt").exists()
         add(key, have, f"{d}")
     rd = md / cfg["robust_denoiser"]
     add("robust_denoiser", rd.exists(), str(rd), optional=True)
+    for sub_den in ("gtcrn_simple.onnx", "dpdfnet4.onnx"):
+        sd_path = md / sub_den
+        if sd_path != rd:
+            add(f"subnoise_denoiser ({sub_den})", sd_path.exists(), str(sd_path), optional=True)
+    trans_dir = md / cfg.get("translation_model", "nllb-200-distilled-600M")
+    add("translation_model", (trans_dir / "model.bin").exists(), str(trans_dir), optional=True)
     vad = md / cfg["vad_model"]
     add("vad_model", vad.exists(), str(vad))
     avail = mic.detect(cfg)
@@ -1036,7 +1101,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ui",
         help="launch graphical web front-end with file picker and hotkeys",
         formatter_class=ColorHelpFormatter,
-        description="Launch local browser-based GUI with file dropzone, live mic controls, and waveform viewer.",
+        description="Launch local browser-based GUI with file dropzone, cue seeking, and waveform viewer.",
         epilog="""EXAMPLES & USAGE:
   stt ui
       Launch web UI on http://127.0.0.1:8080 and open default web browser.
