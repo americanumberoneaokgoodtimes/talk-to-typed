@@ -50,6 +50,12 @@ htmlcov/
 *.flac
 *.ogg
 *.webm
+*.aiff
+*.aif
+*.opus
+*.wma
+*.aac
+*.alac
 
 # Logs and dumps
 dump/
