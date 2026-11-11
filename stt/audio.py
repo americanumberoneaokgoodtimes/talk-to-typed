@@ -438,7 +438,9 @@ def butterworth_highpass(samples: np.ndarray, cutoff_hz: float = 120.0, order: i
     h = 1.0 / np.sqrt(1.0 + (cutoff_hz / freqs) ** (2 * order))
     h[0] = 0.0
     filtered = np.fft.irfft(fft * h, n=n)
-    return (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
+    # Do NOT restore DC mean: HPF is designed to remove DC/low-frequency offset.
+    # Restoring x_mean would re-introduce the DC bias that biases the denoiser's input.
+    return filtered[pad_len : pad_len + n_orig].astype(np.float32)
 
 
 def harmonic_notch_filter(samples: np.ndarray, freqs: tuple[float, ...] = (60.0, 120.0, 180.0), bw_hz: float = 6.0) -> np.ndarray:
@@ -459,6 +461,7 @@ def harmonic_notch_filter(samples: np.ndarray, freqs: tuple[float, ...] = (60.0,
         delta = np.abs(f_axis - f0)
         h_notch *= (delta**2) / (delta**2 + (bw_hz / 2.0)**2)
     filtered = np.fft.irfft(fft * h_notch, n=n)
+    # Notch filter: preserve DC mean (we only removed hum harmonics, not the DC offset)
     return (filtered[pad_len : pad_len + n_orig] + x_mean).astype(np.float32)
 
 
@@ -910,10 +913,26 @@ def profile_audio(samples: np.ndarray) -> AcousticProfile:
     else:
         raw_noise_floor = float(np.sqrt(np.mean(samples ** 2) + 1e-12))
 
-    # 2. Spectral distribution on representative sample (up to 60 seconds across clip)
-    spec_dur = min(len(samples), 60 * SR)
-    spec_samples = samples[:spec_dur]
-    fft_mag2 = np.abs(np.fft.rfft(spec_samples)) ** 2
+    # 2. Spectral distribution on representative sample.
+    # For files > 60s, use stratified windows (25%, 50%, 75%) and average spectra so that
+    # intro music / ambient noise at the start doesn't miscalibrate filters for the whole file.
+    WIN_LEN = 20 * SR  # 20-second analysis window
+    if len(samples) > 60 * SR:
+        total = len(samples)
+        anchors = [int(total * f) for f in (0.25, 0.50, 0.75)]
+        windows = [samples[max(0, a - WIN_LEN // 2): a + WIN_LEN // 2] for a in anchors]
+        windows = [w for w in windows if len(w) >= SR]  # skip sub-second stubs
+        if windows:
+            max_w = max(len(w) for w in windows)
+            stack = np.vstack([np.pad(w, (0, max_w - len(w))) for w in windows]).astype(np.float32)
+            fft_mag2 = np.mean(np.abs(np.fft.rfft(stack, axis=1)) ** 2, axis=0)
+            spec_dur = max_w
+        else:
+            spec_dur = min(len(samples), 60 * SR)
+            fft_mag2 = np.abs(np.fft.rfft(samples[:spec_dur])) ** 2
+    else:
+        spec_dur = len(samples)
+        fft_mag2 = np.abs(np.fft.rfft(samples)) ** 2
     freqs = np.fft.rfftfreq(spec_dur, 1.0 / SR)
 
     total_energy = float(np.sum(fft_mag2)) + 1e-12
@@ -1160,7 +1179,8 @@ def adaptive_spectral_gate(
     out_stft = np.zeros_like(stft)
 
     beta_rise = 0.006
-    beta_fall = 0.14
+    beta_fall = 0.04  # Reduced from 0.14: aggressive fall caused noise-estimate drop during pauses,
+                      # leading to word-onset under-enhancement when speech resumed.
     alpha_p = 0.80
 
     for m in range(n_frames):

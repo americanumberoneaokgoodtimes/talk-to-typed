@@ -241,7 +241,7 @@ def _variants(level: int, cfg: dict) -> list[dict]:
                 vad=dict(loose, vad_threshold=cfg["robust_vad_threshold"], vad_max_speech=cfg["robust_vad_max_speech"]))
     if level == 3:
         return [main]
-    alt = dict(denoise=True, mix=0.6, vad=dict(main["vad"], vad_max_speech=20.0))
+    alt = dict(denoise=True, mix=min(0.80, cfg["robust_mix"] + 0.30), vad=dict(main["vad"], vad_max_speech=20.0))
     return [main, alt]
 
 
@@ -357,7 +357,10 @@ def score_coherence(text: str, dur_sec: float) -> tuple[float, str]:
             return 0.05, f"repetitive phrase '{' '.join(most_bi)}'"
 
     ttr = len(counts) / len(words)
-    fitness = (len(counts) * 2.5) + (ttr * 6.0) - (dom_ratio * 4.0)
+    # Normalize by word count so hallucinated word-soups don't score higher than natural speech.
+    # Include entropy so diverse-looking noise hallucinations are penalized.
+    # Result is in [0, ~8] for typical clean speech; >4.5 is high-quality.
+    fitness = (ttr * 6.0) + (entropy * 0.8) - (dom_ratio * 4.0)
     return round(fitness, 2), "coherent"
 
 
@@ -431,7 +434,9 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
             duration = max(slot_end, tw["end"]) - min(slot_start, tw["start"])
             iou = overlap / max(duration, 1e-6)
             center_dist = abs(((tw["start"] + tw["end"]) / 2.0) - ((slot_start + slot_end) / 2.0))
-            if iou >= 0.20 or center_dist <= 0.28:
+            max_word_dur = max(tw["end"] - tw["start"], slot_end - slot_start)
+            center_tol = max(0.12, 0.40 * max_word_dur)
+            if iou >= 0.20 or center_dist <= center_tol:
                 if not any(w["stream_idx"] == tw["stream_idx"] for w in slot):
                     slot.append(tw)
                     placed = True
@@ -493,11 +498,14 @@ def cn_rover_fuse(stream_candidates: list[dict], dur_sec: float) -> list[dict]:
         if best_clean is not None:
             data = grouped[best_clean]
             best_repr = max(data["words"], key=lambda x: (len(x), x[0].isupper()))
+            w_arr = np.array(data["individual_weights"], dtype=np.float32)
+            c_arr = np.array(data["confs"], dtype=np.float32)
+            out_conf = float(np.sum(w_arr * c_arr) / max(np.sum(w_arr), 1e-6))
             fused_words.append({
                 "word": best_repr,
                 "global_start": round(float(np.median(data["starts"])), 3),
                 "global_end": round(float(np.median(data["ends"])), 3),
-                "conf": float(np.mean(data["confs"])),
+                "conf": out_conf,
             })
 
     fused_words.sort(key=lambda x: x["global_start"])
@@ -518,7 +526,7 @@ def merge_words_morphological(emitted: list[dict], new_words: list[dict]):
         for idx in range(prior_len - 1, -1, -1):
             past = emitted[idx]
             # Stop scanning back once prior words are well before this word's timestamp
-            if past["global_end"] < nw["global_start"] - 1.10 and past["global_start"] < nw["global_start"] - 1.10:
+            if past["global_end"] < nw["global_start"] - 2.50 and past["global_start"] < nw["global_start"] - 2.50:
                 break
 
             past_clean = past["word"].strip(".,?!;:\"'()").lower()
@@ -613,7 +621,7 @@ def assemble_cohesive_sentences(
 
                 f_idx = min(len(local_noise_floor) - 1, int(prev_word_entry["global_end"] / 0.25)) if local_noise_floor is not None and len(local_noise_floor) > 0 else 0
                 floor_rms = float(local_noise_floor[f_idx]) if local_noise_floor is not None and len(local_noise_floor) > 0 else 0.005
-                if gap_rms >= floor_rms * 0.90:
+                if gap_rms >= floor_rms * 1.30:  # gap must be ~3 dB above noise floor to signal continuation
                     is_acoustically_continuous = True
 
         should_bridge = False
@@ -925,7 +933,7 @@ def subnoise_transcribe(
         )
         probe_txt = " ".join(w["word"] for w in probe_words).strip()
 
-        if probe_txt and probe_item.get("confidence", 0.0) >= 0.65 and probe_item.get("zero_skip_ratio", 0.0) <= 0.35 and probe_sc > 1.0:
+        if probe_txt and probe_item.get("confidence", 0.0) >= 0.65 and probe_item.get("zero_skip_ratio", 0.0) <= 0.35 and probe_sc > 2.5:
             raw_hits.append((round(t0, 2), round(t1, 2), probe_txt))
             merge_words_morphological(emitted_words, probe_words)
             fast_exits += 1

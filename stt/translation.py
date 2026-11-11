@@ -13,21 +13,38 @@ _sentencepiece = None
 _translators: dict = {}
 _translators_lock = threading.Lock()
 
-# Standard FLORES-200 language tokens used by NLLB-200 distilled CTranslate2 models
-NLLB_CODES = {
-    "en": "eng_Latn",
-    "es": "spa_Latn",
-    "pt": "por_Latn",
-    "de": "deu_Latn",
-    "fr": "fra_Latn",
-}
-
 LEGACY_NLLB_CODES = {
     "en": "eng",
     "es": "spa",
     "pt": "por",
     "de": "deu",
     "fr": "fra",
+    "it": "ita",
+    "nl": "nld",
+    "pl": "pol",
+    "ru": "rus",
+    "zh": "zho",
+    "ja": "jpn",
+    "ko": "kor",
+    "ar": "ara",
+    "hi": "hin",
+}
+
+NLLB_CODES = {
+    "en": "eng_Latn",
+    "es": "spa_Latn",
+    "pt": "por_Latn",
+    "de": "deu_Latn",
+    "fr": "fra_Latn",
+    "it": "ita_Latn",
+    "nl": "nld_Latn",
+    "pl": "pol_Latn",
+    "ru": "rus_Cyrl",
+    "zh": "zho_Hans",
+    "ja": "jpn_Jpan",
+    "ko": "kor_Hang",
+    "ar": "arb_Arab",
+    "hi": "hin_Deva",
 }
 
 # High-frequency distinctive function words (normalized ASCII + accented forms handled dynamically)
@@ -78,6 +95,30 @@ LANG_MARKERS = {
         "dois", "tres", "primeiro", "ultimo", "outro", "mesmo", "diferente", "igual",
         "grande", "pequeno", "bom", "boa", "mau", "novo", "velho", "alto", "baixo", "longo", "curto",
         "ola", "mundo", "voce", "hoje", "frase", "portugues", "testar", "deteccao", "esta", "sao", "uma",
+    },
+    "de": {
+        "der", "die", "das", "des", "dem", "den", "ein", "eine", "eines", "einem", "einen",
+        "und", "oder", "aber", "wenn", "weil", "dass", "nicht", "auch", "noch", "schon",
+        "ich", "du", "er", "sie", "es", "wir", "ihr", "sie", "mich", "dich", "sich",
+        "ist", "war", "wird", "haben", "sein", "werden", "kann", "muss", "soll", "darf",
+        "mit", "von", "zu", "aus", "an", "auf", "bei", "nach", "vor", "zwischen",
+        "uber", "unter", "durch", "fur", "ohne", "gegen", "um", "bis", "seit", "trotz",
+        "wie", "was", "wer", "wo", "wann", "warum", "welche", "welcher", "welches",
+        "sehr", "mehr", "viel", "wenig", "gut", "schlecht", "gross", "klein", "neu", "alt",
+        "hallo", "heute", "immer", "nie", "jetzt", "hier", "da", "so", "doch", "ja", "nein",
+        "deutsch", "sprache", "bitte", "danke", "entschuldigung", "gesundheit",
+    },
+    "fr": {
+        "le", "la", "les", "un", "une", "des", "du", "de", "au", "aux",
+        "et", "ou", "mais", "donc", "car", "ni", "or", "que", "qui", "quoi",
+        "je", "tu", "il", "elle", "nous", "vous", "ils", "elles", "me", "te", "se",
+        "est", "sont", "etait", "avoir", "etre", "faire", "pouvoir", "vouloir", "devoir",
+        "avec", "pour", "par", "sur", "sous", "dans", "entre", "vers", "chez", "depuis",
+        "comme", "quand", "ou", "comment", "pourquoi", "combien", "quel", "quelle",
+        "tres", "plus", "moins", "bien", "mal", "grand", "petit", "nouveau", "vieux",
+        "oui", "non", "merci", "bonjour", "bonsoir", "aurevoir", "pardon", "voici",
+        "maintenant", "toujours", "jamais", "encore", "deja", "aussi", "meme", "autre",
+        "france", "francais", "francaise", "langue", "monde", "aujourd",
     },
 }
 
@@ -277,20 +318,26 @@ def translate_segments(
         
         translated_segments = []
         for i, (start, end, src_text) in enumerate(segments):
-            target_tokens = list(results[i].hypotheses[0])
-            while target_tokens and target_tokens[0] in (tgt_token, "<s>", "</s>"):
-                target_tokens = target_tokens[1:]
-            while target_tokens and target_tokens[-1] in ("</s>", "<s>"):
-                target_tokens = target_tokens[:-1]
-            translated = spm.decode_pieces(target_tokens).strip()
+            try:
+                target_tokens = list(results[i].hypotheses[0])
+                while target_tokens and target_tokens[0] in (tgt_token, "<s>", "</s>"):
+                    target_tokens = target_tokens[1:]
+                while target_tokens and target_tokens[-1] in ("</s>", "<s>"):
+                    target_tokens = target_tokens[:-1]
+                translated = spm.decode_pieces(target_tokens).strip()
+            except Exception as seg_err:
+                import sys as _sys
+                print(f"[stt] Translation segment {i} failed: {seg_err}", file=_sys.stderr)
+                translated = src_text  # fall back to original rather than propagating error
             translated_segments.append((start, end, src_text, translated))
             _invoke_progress_cb(progress_cb, i + 1, len(segments))
-        
+
         return translated_segments
-        
+
     except Exception as e:
-        print(f"[stt] Translation failed: {e}", file=__import__('sys').stderr)
-        return [(s, e, t, f"[Translation error] {t}") for s, e, t in segments]
+        import sys as _sys
+        print(f"[stt] Translation batch failed: {e}", file=_sys.stderr)
+        return [(s, e, t, t) for s, e, t in segments]  # fall back to identity (untranslated)
 
 
 def _strip_accents(s: str) -> str:
@@ -319,7 +366,7 @@ def detect_language_simple(text: str) -> tuple[str, float]:
     tokens_norm = [_strip_accents(w.replace("'", "")) for w in tokens_raw]
     n_toks = len(tokens_norm)
 
-    scores = {"en": 0.0, "es": 0.0, "pt": 0.0}
+    scores = {lang: 0.0 for lang in LANG_MARKERS}
     for w in tokens_norm:
         for lang, markers in LANG_MARKERS.items():
             if w in markers:
@@ -330,6 +377,10 @@ def detect_language_simple(text: str) -> tuple[str, float]:
         scores["es"] += 2.0
     if any(ch in raw_lower for ch in ("ã", "õ", "ç", "ê", "ô")):
         scores["pt"] += 2.0
+    if any(ch in raw_lower for ch in ("ä", "ö", "ü", "ß")):
+        scores["de"] += 2.5
+    if any(ch in raw_lower for ch in ("è", "é", "ê", "œ", "î", "û", "à", "â")):
+        scores["fr"] += 2.0
     for w in tokens_raw:
         if w.endswith(("ción", "ciones", "mente")) and "ñ" in raw_lower:
             scores["es"] += 0.8
@@ -337,6 +388,10 @@ def detect_language_simple(text: str) -> tuple[str, float]:
             scores["pt"] += 1.2
         elif "'" in w or w.endswith(("ing", "ght", "tion")) or w.startswith(("th", "wh", "sh")):
             scores["en"] += 0.6
+        elif w.endswith(("ung", "heit", "keit", "schaft", "lich", "isch")):
+            scores["de"] += 0.9
+        elif w.endswith(("tion", "ment", "eux", "euse", "iste", "ique")):
+            scores["fr"] += 0.7
 
     best_lang = max(scores, key=scores.get)
     best_hits = scores[best_lang]

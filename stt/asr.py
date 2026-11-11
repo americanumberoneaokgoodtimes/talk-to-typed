@@ -121,6 +121,7 @@ def get_offline(
         decoding_method,
         max_active_paths,
     )
+    evicted = []
     with _offline_cache_lock:
         if key in _offline_cache:
             val = _offline_cache.pop(key)
@@ -128,9 +129,7 @@ def get_offline(
             return val
         while len(_offline_cache) >= _MAX_OFFLINE_CACHE:
             oldest_key = next(iter(_offline_cache))
-            del _offline_cache[oldest_key]
-            import gc
-            gc.collect()
+            evicted.append(_offline_cache.pop(oldest_key))
         _offline_cache[key] = offline(
             cfg,
             model=model,
@@ -139,7 +138,14 @@ def get_offline(
             decoding_method=decoding_method,
             max_active_paths=max_active_paths,
         )
-        return _offline_cache[key]
+        result = _offline_cache[key]
+    # Release evicted recognizers and trigger GC outside the lock to avoid
+    # potential deadlock with ONNX Runtime's internal thread pool finalizers.
+    if evicted:
+        del evicted
+        import gc
+        gc.collect()
+    return result
 
 
 def streaming(cfg: dict, model: str | None = None, threads: int | None = None):
@@ -150,14 +156,8 @@ def streaming(cfg: dict, model: str | None = None, threads: int | None = None):
 
 
 def transcribe(rec, chunks: list[np.ndarray]) -> list[str]:
-    """Decode a list of 16 kHz float32 arrays with an offline recognizer (process each chunk individually)."""
-    texts = []
-    for c in chunks:
-        s = rec.create_stream()
-        s.accept_waveform(SR, c)
-        rec.decode_stream(s)  # Process each stream individually to avoid OOM
-        texts.append(s.result.text.strip())
-    return texts
+    """Decode a list of 16 kHz float32 arrays using batch decoding (2 at a time) for throughput."""
+    return [d["text"] for d in transcribe_batch_detailed(rec, chunks, max_batch_size=2)]
 
 
 def transcribe_batch(rec, chunks: list[np.ndarray], max_batch_size: int = 2) -> list[str]:
