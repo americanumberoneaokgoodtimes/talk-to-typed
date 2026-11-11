@@ -1,6 +1,6 @@
 # HANDOFF — `talk-to-typed` (`stt`) Offline Speech-to-Text CLI
 
-Updated November 2026 for any agent or engineer taking over the project. Read this first, followed by [`docs/ARCHITECTURE.md`](file:///C:/Users/o/Desktop/stt/docs/ARCHITECTURE.md) and [`README.md`](file:///C:/Users/o/Desktop/stt/README.md).
+Updated November 2026 for any agent or engineer taking over the project. Read this first, followed by [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`README.md`](README.md).
 
 ---
 
@@ -41,18 +41,18 @@ stt/
 ```
 
 ### Critical Innovations Implemented in This System:
-1. **Adaptive Acoustic Profiler & Hum Notcher ([`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py))**:
+1. **Adaptive Acoustic Profiler & Hum Notcher ([`stt/audio.py`](stt/audio.py))**:
    - `profile_audio(samples)`: Evaluates 15th percentile noise floor, top-sustained peak energy, power-grid hum prominence (50 Hz vs 60 Hz on quiet frames up to 600 Hz), low-frequency rumble fraction (<120 Hz), and speech-band formant energy (300–3200 Hz).
    - Generates zero-phase Butterworth high-pass cutoff (80 Hz to 130 Hz).
    - Injects harmonic notch filters (`60/120/180/240/300/360/420/480/540/600 Hz` or `50/.../600 Hz`) when hum prominence > 4.0x.
    - Computes dynamic speech formant boost (+0.0 dB to +5.0 dB) and dynamic transducer blank penalty ($0.30$ to $1.05$).
-2. **4-Cue Speech Presence Probability & Ephraim-Malah Log-MMSE ([`stt/audio.py`](file:///C:/Users/o/Desktop/stt/stt/audio.py))**:
+2. **4-Cue Speech Presence Probability & Ephraim-Malah Log-MMSE ([`stt/audio.py`](stt/audio.py))**:
    - `compute_speech_presence_prob`: 50 Hz frame composite of post-denoiser emergence, 2-8 Hz syllabic modulation, formant spectral structure (1 - spectral flatness), and low-band periodicity.
    - `adaptive_spectral_gate`: Rational Padé approximation of Log-MMSE with MCRA noise tracking.
-3. **Parallel Stream Decoding & CN-ROVER ([`stt/asr.py`](file:///C:/Users/o/Desktop/stt/stt/asr.py), [`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py))**:
+3. **Parallel Stream Decoding & CN-ROVER ([`stt/asr.py`](stt/asr.py), [`stt/robust.py`](stt/robust.py))**:
    - `transcribe_batch` / `decode_streams`: Concurrently decodes 7 enhancement streams (`gtcrn`, `hybrid`, `blend`, `dp4`, `formant_agc`, `spec_gate`, `hp`).
    - `cn_rover_fuse`: Time-synchronous Confusion Network ROVER with token-level confidence weighting and specialist single-stream recovery.
-4. **Dual-Layer & Gap Recovery with Burial Telemetry ([`stt/robust.py`](file:///C:/Users/o/Desktop/stt/stt/robust.py))**:
+4. **Dual-Layer & Gap Recovery with Burial Telemetry ([`stt/robust.py`](stt/robust.py))**:
    - Recovers loud foreground speech AND scans untranscribed gaps for buried background speech.
    - Computes and logs acoustic burial depth ($\Delta_{\text{floor}}$ and $\Delta_{\text{fg}}$) with timeline timestamps `[MM:SS.mmm -> MM:SS.mmm]`, exported to terminal, `--jsonl`, and Web UI.
 

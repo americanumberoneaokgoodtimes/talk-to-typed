@@ -29,8 +29,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e ".[dev]"
           pip install pytest build wheel
+          # Pin sherpa-onnx to a known-good wheel; update this line when upgrading
+          pip install "sherpa-onnx>=1.10.0,<2.0" --prefer-binary || true
 
       - name: Run test suite
         run: |

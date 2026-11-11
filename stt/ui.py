@@ -76,6 +76,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>talk-to-typed — Offline Speech-to-Text</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 24 24' fill='none' stroke='%233b82f6' stroke-width='2'><path d='M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z'/><path d='M19 10v2a7 7 0 0 1-14 0v-2'/><line x1='12' x2='12' y1='19' y2='22'/></svg>">
 <style>
   :root {
     --bg-dark: #0f1117;
@@ -91,6 +92,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --warning: #f59e0b;
     --danger: #ef4444;
     --code-bg: #090b10;
+  }
+
+  body.light-theme {
+    --bg-dark: #f8fafc;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f1f5f9;
+    --border: #e2e8f0;
+    --accent: #2563eb;
+    --accent-glow: rgba(37, 99, 235, 0.12);
+    --accent-hover: #1d4ed8;
+    --text-main: #0f172a;
+    --text-muted: #64748b;
+    --success: #059669;
+    --warning: #d97706;
+    --danger: #dc2626;
+    --code-bg: #f1f5f9;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -567,6 +584,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="badge">v%STT_VERSION%</span>
   </div>
   <div class="header-actions">
+    <button class="btn btn-outline btn-sm" id="btnTheme" title="Toggle Light/Dark Theme">◑ Theme</button>
+    <button class="btn btn-outline btn-sm" id="btnHistory" title="Session History">⏱ History</button>
     <button class="btn btn-outline btn-sm" id="btnHotkeys" title="Keyboard Shortcuts (?)">
       <kbd>?</kbd> Hotkeys
     </button>
@@ -580,12 +599,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="control-group">
       <label for="strategy">Mode <span class="label-desc">(Alt+A / Alt+N)</span></label>
       <select id="strategy">
-        <option value="auto" selected>Auto Dynamic Sub-Noise (Recommended)</option>
-        <option value="subnoise">Force Aggressive Sub-Noise Scan</option>
-        <option value="standard">Standard Silero VAD (Clean Audio)</option>
-        <option value="robust">Robust Denoiser (Level 3)</option>
-        <option value="distant">Distant Whisper (Level 5)</option>
+        <optgroup label="Adaptive Recovery">
+          <option value="auto" selected>Auto — adaptive sub-noise profiling (recommended)</option>
+          <option value="dynamic">Dynamic CN-ROVER — 4-model ensemble, best for faint speech</option>
+          <option value="subnoise">Force Sub-Noise — aggressive low-energy scan (slowest)</option>
+        </optgroup>
+        <optgroup label="Fixed Denoising">
+          <option value="standard">Standard VAD — clean audio, fastest</option>
+          <option value="robust">Robust — moderate noise, Level 3 denoiser</option>
+          <option value="distant">Distant — heavy noise, Level 5 denoiser</option>
+        </optgroup>
+        <optgroup label="Research">
+          <option value="all">Matrix All-Models — compare all combinations (slow)</option>
+        </optgroup>
       </select>
+    </div>
+
+    <div class="control-group">
+      <label for="modelSelect">ASR Model</label>
+      <select id="modelSelect">
+        <option value="">Default (from config)</option>
+      </select>
+      <span class="label-desc">Installed models auto-loaded.</span>
     </div>
 
     <div class="section-title">Language & Translation</div>
@@ -596,6 +631,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="en">English</option>
         <option value="es">Spanish</option>
         <option value="pt">Portuguese</option>
+        <option value="fr">French</option>
+        <option value="de">German</option>
+        <option value="it">Italian</option>
+        <option value="nl">Dutch</option>
+        <option value="pl">Polish</option>
+        <option value="ru">Russian</option>
+        <option value="zh">Chinese</option>
+        <option value="ja">Japanese</option>
+        <option value="ko">Korean</option>
+        <option value="ar">Arabic</option>
+        <option value="hi">Hindi</option>
       </select>
     </div>
     <div class="control-group">
@@ -604,6 +650,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <option value="en" selected>English</option>
         <option value="es">Spanish</option>
         <option value="pt">Portuguese</option>
+        <option value="fr">French</option>
+        <option value="de">German</option>
+        <option value="it">Italian</option>
+        <option value="nl">Dutch</option>
+        <option value="pl">Polish</option>
+        <option value="ru">Russian</option>
+        <option value="zh">Chinese</option>
+        <option value="ja">Japanese</option>
+        <option value="ko">Korean</option>
+        <option value="ar">Arabic</option>
+        <option value="hi">Hindi</option>
       </select>
     </div>
     <div class="control-group">
@@ -643,6 +700,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <input type="range" id="blankPenalty" min="0.0" max="1.5" step="0.1" value="0.6">
       </div>
       <span class="label-desc">Forces phoneme emission on faint speech without token loops.</span>
+    </div>
+
+    <div class="section-title">Time Range <span class="label-desc">(optional)</span></div>
+    <div class="control-group">
+      <label for="rangeStart">Start (seconds)</label>
+      <input type="number" id="rangeStart" value="" step="0.1" min="0" placeholder="0 = beginning">
+    </div>
+    <div class="control-group">
+      <label for="rangeEnd">End (seconds)</label>
+      <input type="number" id="rangeEnd" value="" step="0.1" min="0" placeholder="blank = end">
     </div>
 
     <div class="section-title">Window & Performance</div>
@@ -728,6 +795,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- SNR / Auto-Profile Badge -->
+    <div id="snrBadge" style="display:none; padding:6px 12px; background:var(--code-bg); border:1px solid var(--border); border-radius:6px; font-size:0.82rem; color:var(--text-muted); margin-bottom:8px;">
+      <strong style="color:var(--accent);">Profile:</strong> <span id="snrBadgeText"></span>
+    </div>
+
     <!-- Output Textbox Card -->
     <div class="output-card">
       <div class="output-header">
@@ -801,15 +873,53 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <tr><td><kbd>Alt+A</kbd></td><td>Switch to Auto Mode</td></tr>
       <tr><td><kbd>Alt+N</kbd></td><td>Switch to Sub-Noise Mode</td></tr>
       <tr><td><kbd>Alt+X</kbd></td><td>Clear Output Text</td></tr>
+      <tr><td><kbd>Alt+Z</kbd></td><td>Cancel Transcription</td></tr>
       <tr><td><kbd>?</kbd> / <kbd>F1</kbd></td><td>Toggle this Hotkey Guide</td></tr>
       <tr><td><kbd>Esc</kbd></td><td>Close Modal</td></tr>
     </table>
   </div>
 </div>
 
+<!-- History Modal -->
+<div class="modal-overlay" id="historyOverlay" style="display:none;">
+  <div class="modal" style="max-width:600px; width:90vw;">
+    <h3>
+      Session History
+      <button class="btn btn-outline btn-sm" id="btnCloseHistory">✕</button>
+    </h3>
+    <div id="historyList" style="max-height:60vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+      <p style="color:var(--text-muted); font-size:0.85rem;">No previous transcriptions this session.</p>
+    </div>
+  </div>
+</div>
+
 <script>
+  // Theme persistence
+  if (localStorage.getItem('stt-theme') === 'light') document.body.classList.add('light-theme');
+  document.getElementById('btnTheme').onclick = () => {
+    document.body.classList.toggle('light-theme');
+    localStorage.setItem('stt-theme', document.body.classList.contains('light-theme') ? 'light' : 'dark');
+  };
+
+  // Load installed models
+  (async function loadModels() {
+    try {
+      const r = await fetch('/api/models');
+      if (!r.ok) return;
+      const models = await r.json();
+      const sel = document.getElementById('modelSelect');
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m.name;
+        opt.textContent = `${m.name} (${m.kind || 'asr'}, ${(m.size_mb || 0).toFixed(0)} MB)${m.active ? ' ✓' : ''}`;
+        sel.appendChild(opt);
+      }
+    } catch {}
+  })();
+
   let selectedFiles = [];
   let segmentsHistory = [];
+  let transcriptHistory = [];
 
   // DOM Elements
   const dropzone = document.getElementById('dropzone');
@@ -1074,8 +1184,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const strategyVal = document.getElementById('strategy').value;
     const useManual = (k) => strategyVal !== 'auto' || touchedControls.has(k);
 
+    const rangeStartRaw = document.getElementById('rangeStart').value.trim();
+    const rangeEndRaw = document.getElementById('rangeEnd').value.trim();
     const payload = {
       strategy: strategyVal,
+      model: document.getElementById('modelSelect').value || null,
       rumble_cutoff: useManual('rumble_cutoff') ? parseFloat(rumbleCutoff.value) : null,
       formant_boost: useManual('formant_boost') ? parseFloat(formantBoost.value) : null,
       blank_penalty: useManual('blank_penalty') ? parseFloat(blankPenalty.value) : null,
@@ -1084,6 +1197,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       threads: parseInt(document.getElementById('threads').value),
       recursive: document.getElementById('recursive').checked,
       server_path: pathVal || null,
+      start_sec: rangeStartRaw !== '' ? parseFloat(rangeStartRaw) : null,
+      end_sec: rangeEndRaw !== '' ? parseFloat(rangeEndRaw) : null,
       // Multilingual & Translation
       source_lang: document.getElementById('langSource').value,
       target_lang: document.getElementById('langTarget').value,
@@ -1102,6 +1217,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     reasoningBox.style.display = 'none';
     errorBanner.style.display = 'none';
+    document.getElementById('snrBadge').style.display = 'none';
     progressWrap.style.display = 'block';
     progFill.style.width = '0%';
     progPct.textContent = '0%';
@@ -1203,6 +1319,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 reasoningList.appendChild(li);
               }
               reasoningBox.style.display = 'block';
+              const snrBadge = document.getElementById('snrBadge');
+              const snrText = document.getElementById('snrBadgeText');
+              if (typeof data.snr_db === 'number') {
+                snrText.textContent = `SNR ${data.snr_db >= 0 ? '+' : ''}${data.snr_db.toFixed(1)} dB`;
+                snrBadge.style.display = 'block';
+              } else {
+                // Extract SNR from reasoning lines if not provided directly
+                const snrLine = data.reasons.find(r => r.includes('dB') || r.includes('SNR'));
+                if (snrLine) { snrText.textContent = snrLine; snrBadge.style.display = 'block'; }
+              }
             } else if (eventType === "progress") {
               progFill.style.width = `${data.pct}%`;
               progPct.textContent = `${data.pct}%`;
@@ -1269,6 +1395,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
             } else if (eventType === "done") {
               progressWrap.style.display = 'none';
               procStats.textContent = `Completed in ${data.elapsed.toFixed(1)}s (RTF: ${data.rtf.toFixed(2)}x)`;
+              const histEntry = {
+                ts: new Date().toLocaleTimeString(),
+                text: output.value,
+                segments: segmentsHistory.slice(),
+                label: (selectedFiles.length ? selectedFiles[0].name : (serverPath.value || 'unknown')),
+              };
+              transcriptHistory.unshift(histEntry);
+              renderHistory();
             } else if (eventType === "error") {
               progressWrap.style.display = 'none';
               errorBanner.textContent = 'Transcription error: ' + data.message;
@@ -1299,6 +1433,45 @@ HTML_PAGE = r"""<!DOCTYPE html>
     wordStats.textContent = `${words} words | ${chars} characters`;
   }
   output.addEventListener('input', updateStats);
+
+  // History modal
+  function renderHistory() {
+    const list = document.getElementById('historyList');
+    if (!transcriptHistory.length) {
+      list.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">No previous transcriptions this session.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    transcriptHistory.forEach((entry, i) => {
+      const div = document.createElement('div');
+      div.style.cssText = 'background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:10px 12px; cursor:pointer;';
+      div.innerHTML = `<div style="display:flex; justify-content:space-between; margin-bottom:4px;"><strong style="font-size:0.85rem;">${escapeHtml(entry.label)}</strong><span style="color:var(--text-muted); font-size:0.78rem;">${entry.ts}</span></div><div style="font-size:0.8rem; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(entry.text.substring(0, 120))}${entry.text.length > 120 ? '...' : ''}</div>`;
+      div.onclick = () => {
+        output.value = entry.text;
+        segmentsHistory = entry.segments;
+        segmentsList.innerHTML = '';
+        entry.segments.forEach(d => {
+          const segEl = document.createElement('div');
+          segEl.className = 'segment-item';
+          segEl.dataset.start = d.start;
+          segEl.dataset.end = d.end;
+          segEl.innerHTML = `<span class="seg-time">${formatSec(d.start)} → ${formatSec(d.end)}</span><span class="seg-text">${escapeHtml(d.text)}</span>`;
+          segEl.onclick = () => { audioPlayer.currentTime = d.start; audioPlayer.play(); };
+          segmentsList.appendChild(segEl);
+        });
+        updateStats();
+        document.getElementById('historyOverlay').style.display = 'none';
+      };
+      list.appendChild(div);
+    });
+  }
+  document.getElementById('btnHistory').onclick = () => {
+    renderHistory();
+    document.getElementById('historyOverlay').style.display = 'flex';
+  };
+  document.getElementById('btnCloseHistory').onclick = () => {
+    document.getElementById('historyOverlay').style.display = 'none';
+  };
 
   // Copy
   document.getElementById('btnCopy').onclick = () => {
@@ -1541,6 +1714,15 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif parsed.path == "/api/models":
+            cfg = self.server.cfg
+            rows = asr.catalog(cfg)
+            body = json.dumps(rows).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif parsed.path == "/api/audio":
             if not _is_same_origin_or_local(self.headers):
                 self.send_error(403, "Cross-origin request denied")
@@ -1738,16 +1920,20 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
             do_translate = bool(req.get("translate", False))
             use_multilingual = do_translate or (source_lang not in ("auto", "en"))
 
+            selected_model = req.get("model") or None
             if use_multilingual:
-                rec = asr.get_multilingual_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
+                rec = asr.get_multilingual_offline(cfg, model=selected_model, threads=threads, blank_penalty=blank_penalty)
             else:
-                rec = asr.get_offline(cfg, model=None, threads=threads, blank_penalty=blank_penalty)
+                rec = asr.get_offline(cfg, model=selected_model, threads=threads, blank_penalty=blank_penalty)
         except Exception as e:
             send_sse("error", {"message": f"Failed to load ASR model: {e}"})
             return
 
         strategy = req.get("strategy", "auto")
         is_subnoise = strategy in ("auto", "subnoise")
+        is_dynamic = strategy == "dynamic"
+        if is_dynamic:
+            is_subnoise = True  # dynamic uses same auto-tune path + CN-ROVER ensemble
 
         t0_total = time.time()
         total_audio_sec = 0.0
@@ -1758,8 +1944,14 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             disp_name = display_names.get(path, Path(path).name) if display_names else Path(path).name
+            range_start = req.get("start_sec")
+            range_end = req.get("end_sec")
             try:
-                samples = audio.decode(path)
+                samples = audio.decode(
+                    path,
+                    start_sec=float(range_start) if range_start is not None else None,
+                    end_sec=float(range_end) if range_end is not None else None,
+                )
             except Exception as e:
                 send_sse("segment", {"file": disp_name, "start": 0, "end": 0, "text": f"[Error decoding {disp_name}: {e}]"})
                 continue
@@ -1810,7 +2002,34 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                     if req.get("step_size") is not None:
                         params["step_sec"] = float(req["step_size"])
 
-                    send_sse("reasoning", {"file": disp_name, "duration": dur, "reasons": params["reasoning"]})
+                    snr_val = params.get("snr_db")
+                    send_sse("reasoning", {
+                        "file": disp_name, "duration": dur, "reasons": params["reasoning"],
+                        "snr_db": snr_val,
+                    })
+
+                # Matrix "all-models" mode
+                if strategy == "all":
+                    from . import matrix as _matrix
+                    send_sse("progress", {"file": disp_name, "pct": 5, "cur_time": "00:00",
+                                          "tot_time": f"{int(dur//60):02d}:{int(dur%60):02d}",
+                                          "rtf": 0.0, "eta": "..."})
+                    try:
+                        matrix_results = _matrix.run_matrix(
+                            samples, cfg, audio_path=path,
+                            threads=threads, time_offset=float(range_start or 0),
+                        )
+                        for row in matrix_results:
+                            send_sse("segment", {
+                                "file": disp_name,
+                                "start": round(row.get("start", 0), 2),
+                                "end": round(row.get("end", 0), 2),
+                                "text": f"[{row.get('combo', '?')}] {row.get('text', '')}",
+                            })
+                    except Exception as e:
+                        send_sse("segment", {"file": disp_name, "start": 0, "end": 0,
+                                             "text": f"[Matrix error: {e}]"})
+                    continue
 
                 level = 0 if is_subnoise else (3 if strategy == "robust" else (5 if strategy == "distant" else 0))
 
@@ -1828,7 +2047,7 @@ class STTRequestHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     triples = robust.transcribe(
                         rec, samples, cfg, level=level, subnoise=is_subnoise,
-                        params=params, progress_cb=progress_cb if is_subnoise else None,
+                        params=params, progress_cb=progress_cb,
                         model=None, threads=threads,
                     )
 

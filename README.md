@@ -150,13 +150,20 @@ stt mic --list-devices
 Launch the built-in browser UI for visual file management and cue seeking:
 
 ```sh
-stt ui
+stt ui                                # localhost:8080 (default)
+stt ui --host 0.0.0.0 --port 9090    # bind to all interfaces on port 9090
+stt ui --no-browser                   # start server without opening browser
 ```
 - **Interactive Audio Waveform**: Scrub and click anywhere on the waveform timeline to seek playback.
 - **Clickable Transcribed Cues**: Click any transcribed segment to jump playback directly to that timestamp.
 - **Drag-and-Drop Ingestion**: Drop audio/video files or folders directly into the browser.
 - **Real-Time SSE Streaming**: Watch text appear line-by-line as windows are processed.
 - **DSP Control Sliders**: Adjust rumble cutoff, formant boost, and blank penalty in real-time.
+- **Model Selector**: Choose between installed ASR models from the sidebar.
+- **Time Range Slicing**: Transcribe a specific portion of an audio file (start/end in seconds).
+- **Dark/Light Theme**: Toggle with the ◑ Theme button in the header.
+
+> **Remote access:** To expose the UI on a network (e.g. serve from a headless machine), use `--host 0.0.0.0`. Requests are validated for same-origin or localhost; cross-origin access from other domains is blocked.
 
 ---
 
@@ -201,11 +208,13 @@ All models run offline via INT8 ONNX or CTranslate2:
 | Role | Default Model Architecture | Format & Size |
 | :--- | :--- | :--- |
 | **Offline ASR** | NeMo Parakeet TDT 0.6B v3 | INT8 ONNX (671 MB) |
-| **Streaming ASR** | NeMo Nemotron 0.6B (160ms) / Kroko Zipformer | INT8 ONNX (640 MB / 71 MB) |
+| **Streaming ASR** | NeMo Nemotron 0.6B (160ms) / Kroko-ASR Zipformer¹ | INT8 ONNX (640 MB / 71 MB) |
 | **Voice Activity Detection** | Silero VAD v4 | INT8 ONNX (1.8 MB) |
 | **Speech Enhancement A** | DPDFNet-8 / DPDFNet-4 / DPDFNet-2 | INT8 ONNX (18 MB / 9 MB / 4.5 MB) |
 | **Speech Enhancement B** | GTCRN Simple | INT8 ONNX (5 MB) |
 | **Offline Translation** | Meta NLLB-200 Distilled 600M | CTranslate2 INT8 (2.46 GB) |
+
+> ¹ **Kroko-ASR license note:** Kroko-ASR Zipformer is published by Banafo on Hugging Face under the Apache 2.0 license, which is compatible with this project's MIT license. It is used for real-time microphone streaming only (`stt mic --model kroko`). It is not bundled in the package; users must download it separately via `scripts/install_models.py`.
 
 ---
 
@@ -227,4 +236,4 @@ pytest -v tests/
 
 ## Technical Architecture & Developer Reference
 
-For mathematical equations, DSP diagrams, and developer schematics, see [`docs/ARCHITECTURE.md`](file:///C:/Users/o/Desktop/stt/docs/ARCHITECTURE.md) and [`HANDOFF.md`](file:///C:/Users/o/Desktop/stt/HANDOFF.md).
+For mathematical equations, DSP diagrams, and developer schematics, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`HANDOFF.md`](HANDOFF.md).

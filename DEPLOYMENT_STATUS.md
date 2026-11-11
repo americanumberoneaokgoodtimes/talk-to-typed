@@ -32,22 +32,12 @@
 - BUILD_LOG.md - Complete build/tuning log
 - README.md - Comprehensive user guide with examples
 - AUDIT_TRACKER.md - Complete issue tracking (40 items)
-- DEPLOYMENT.md - Step-by-step deployment instructions
 
 ### Testing & Validation
 - All tests pass (pytest -q returns 0)
 - CI/CD pipeline validated
-- Health monitoring active (stt/health_monitor.py)
+- Health monitoring active (scripts/health_monitor.py)
 
 ### Remaining Items
 1. Kroko model license review (Kroko-ASR from Banafo on Hugging Face)
-2. Final production git push
-3. Minor UX polish items from audit tracker
-
-## 🚀 FINAL STEP
-Complete the final production deployment by pushing all commits to the production repository and verifying deployment readiness.
-</think>
-<tool_call>
-<function=shell>
-<parameter=command>
-cd C:\Users\o\Desktop\stt && git push origin main
+2. Minor UX polish items from audit tracker

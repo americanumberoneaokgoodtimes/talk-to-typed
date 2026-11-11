@@ -218,10 +218,14 @@ def _add_shared_groups(p, is_file: bool = True):
 
     g_trans = p.add_argument_group("MULTILINGUAL & TRANSLATION")
     g_trans.add_argument("--lang", metavar="LANG", help="language hint; ignored by models that auto-detect or are English-only")
-    g_trans.add_argument("--lang-source", choices=["auto", "en", "es", "pt"], metavar="{auto,en,es,pt}", default=None,
-                         help="source language: auto (detect), en, es, pt")
-    g_trans.add_argument("--lang-target", choices=["en", "es", "pt"], metavar="{en,es,pt}", default=None,
-                         help="target language for translation: en, es, pt")
+    _LANG_SRC_CHOICES = ["auto", "en", "es", "pt", "fr", "de", "it", "nl", "pl", "ru", "zh", "ja", "ko", "ar", "hi"]
+    _LANG_TGT_CHOICES = ["en", "es", "pt", "fr", "de", "it", "nl", "pl", "ru", "zh", "ja", "ko", "ar", "hi"]
+    g_trans.add_argument("--lang-source", choices=_LANG_SRC_CHOICES,
+                         metavar="{auto,en,es,pt,fr,de,it,nl,pl,ru,zh,ja,ko,ar,hi}", default=None,
+                         help="source language (NLLB-200 Flores code or 2-letter ISO; auto = detect)")
+    g_trans.add_argument("--lang-target", choices=_LANG_TGT_CHOICES,
+                         metavar="{en,es,pt,fr,de,it,nl,pl,ru,zh,ja,ko,ar,hi}", default=None,
+                         help="target language for translation")
     g_trans.add_argument("--translate", action="store_true",
                          help="enable translation from source to target language")
 
@@ -241,7 +245,12 @@ def _common(p):
 
 def _lang_note(args):
     if args.lang:
-        print(f"note: --lang {args.lang} ignored (selected models auto-detect / are English-only)", file=sys.stderr)
+        # Wire --lang as an alias for --lang-source if --lang-source was not explicitly set
+        if not args.lang_source:
+            args.lang_source = args.lang
+            print(f"note: --lang {args.lang} aliased to --lang-source (use --lang-source directly)", file=sys.stderr)
+        else:
+            print(f"note: --lang {args.lang} ignored because --lang-source={args.lang_source} is set", file=sys.stderr)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -604,9 +613,12 @@ def cmd_file(args, cfg):
                 print(f"[stt file] Processing {dur:.0f}s audio (~{total_chunks} chunks)...", file=sys.stderr)
                 
                 chunk_progress = [0]
-                def progress_report():
+                def progress_report(current_step=None, total_steps=None, current_sec=None, total_sec=None):
                     chunk_progress[0] += 1
-                    pct = min(100, int(chunk_progress[0] / max(total_chunks, 1) * 100))
+                    if total_steps and total_steps > 0:
+                        pct = min(100, int(current_step / total_steps * 100))
+                    else:
+                        pct = min(100, int(chunk_progress[0] / max(total_chunks, 1) * 100))
                     bar = "=" * (pct // 5) + ">" + " " * (20 - pct // 5 - 1)
                     sys.stderr.write(f"\r[stt] [{bar}] {pct:3d}% | Chunk {chunk_progress[0]}/{total_chunks}")
                     sys.stderr.flush()
@@ -864,6 +876,18 @@ def cmd_config(args, cfg):
             print(f"[stt] Deleted {config.CONFIG_PATH}; defaults will be written on next run.")
         else:
             print(f"[stt] Config file not found: {config.CONFIG_PATH}")
+    elif action == "edit":
+        config_path = config.CONFIG_PATH
+        if not config_path.exists():
+            config.load()  # trigger creation of default config
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+        if not editor and sys.platform == "win32":
+            editor = "notepad"
+        if editor:
+            import subprocess
+            subprocess.run([editor, str(config_path)], check=False)
+        else:
+            print(f"[stt] $EDITOR not set. Config file is at:\n  {config_path}")
     elif action == "set":
         if len(args.kv) < 2:
             sys.exit("usage: stt config set KEY VALUE")
@@ -944,6 +968,22 @@ def cmd_doctor(args, cfg):
     all_ok = all(s != "FAIL" for _, s, _ in rows)
     if all_ok and not any_mic:
         print("\nNote: No active microphone backend found. File transcription is fully operational.")
+
+    if not all_ok and getattr(args, "fix", False):
+        fail_names = [n for n, s, _ in rows if s == "FAIL"]
+        print(f"\n[stt doctor --fix] Attempting to fix: {', '.join(fail_names)}", file=sys.stderr)
+        import subprocess
+        script = Path(__file__).parent.parent / "scripts" / "install_models.py"
+        if script.exists():
+            result = subprocess.run([sys.executable, str(script), "--all"], check=False)
+            if result.returncode == 0:
+                print("[stt doctor --fix] Install completed. Re-run `stt doctor` to verify.", file=sys.stderr)
+            else:
+                print("[stt doctor --fix] Install script returned non-zero; check output above.", file=sys.stderr)
+        else:
+            print(f"[stt doctor --fix] Install script not found at {script}", file=sys.stderr)
+            print("  Run: python scripts/install_models.py --all", file=sys.stderr)
+
     sys.exit(0 if all_ok else 1)
 
 
@@ -1127,6 +1167,8 @@ def build_parser() -> argparse.ArgumentParser:
       Run complete diagnostic report to verify system readiness.
 """
     )
+    d.add_argument("--fix", action="store_true",
+                   help="attempt to auto-download missing models when FAIL items are found")
     d.set_defaults(fn=cmd_doctor)
 
     # --- stt config ---
@@ -1152,6 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_sub = cfg_p.add_subparsers(dest="config_action", required=True, title="CONFIG ACTIONS")
     cfg_sub.add_parser("show", help="print config file path and current values", formatter_class=ColorHelpFormatter)
     cfg_sub.add_parser("reset", help="delete config file (defaults restored on next run)", formatter_class=ColorHelpFormatter)
+    cfg_sub.add_parser("edit", help="open config file in $EDITOR (or notepad on Windows)", formatter_class=ColorHelpFormatter)
     cfg_set = cfg_sub.add_parser("set", help="set a config key (e.g. stt config set threads 2)", formatter_class=ColorHelpFormatter)
     cfg_set.add_argument("kv", nargs="+", metavar="KEY VALUE", help="config key followed by desired value")
     cfg_p.set_defaults(fn=cmd_config)

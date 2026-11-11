@@ -63,3 +63,6 @@ crash_dumps/
 
 # Models (downloaded at runtime)
 models/
+
+# R&D exploration scripts (not canonical production code)
+experiments/
